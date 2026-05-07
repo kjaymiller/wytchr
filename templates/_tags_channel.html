@@ -1,0 +1,23 @@
+<div class="tags channel-tags" id="tags-c-{{ channel_name }}">
+  {% for tag in tags %}
+    <span class="tag">
+      <a class="tag-link" href="?tag={{ tag }}"
+         hx-get="/board?tag={{ tag }}"
+         hx-target="#board"
+         hx-swap="innerHTML"
+         hx-push-url="?tag={{ tag }}">{{ tag.split(':', 1)[1] if ':' in tag else tag }}</a>
+      <button class="tag-x"
+              hx-delete="/channels/{{ channel_name }}/tags/{{ tag }}"
+              hx-target='[id="tags-c-{{ channel_name }}"]'
+              hx-swap="outerHTML"
+              aria-label="remove tag">×</button>
+    </span>
+  {% endfor %}
+  <button class="tag-edit-btn" type="button" aria-label="add tag">+</button>
+  <form class="tag-add"
+        hx-post="/channels/{{ channel_name }}/tags"
+        hx-target='[id="tags-c-{{ channel_name }}"]'
+        hx-swap="outerHTML">
+    <input name="name" placeholder="prefix:tag" maxlength="64" autocomplete="off" aria-label="add tag">
+  </form>
+</div>

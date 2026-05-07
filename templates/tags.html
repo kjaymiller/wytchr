@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>wytchr · tags</title>
+  <style>
+    :root { color-scheme: dark; }
+    body, body[data-theme="licorice"] { --bg:#0a060d; --card:#15101a; --line:#2d2238; --fg:#f3e9e6; --muted:#8a7d8a; --accent:#ff5f87; --accent-ink:#1a0a14; --danger:#f25b5b; --ok:#b8e0a3; }
+    body[data-theme="marmite"] { --bg:#14100a; --card:#221a10; --line:#3d2f1d; --fg:#f7e7a8; --muted:#a89568; --accent:#f5c518; --accent-ink:#1a1208; --danger:#d63d3d; --ok:#9bc053; }
+    body[data-theme="sees"] { --bg:#14100c; --card:#221a14; --line:#3d2e22; --fg:#f5ebe0; --muted:#a89578; --accent:#d4a574; --accent-ink:#14100c; --danger:#c84545; --ok:#9aae6a; }
+    body[data-theme="jaffa"] { --bg:#1c0e04; --card:#2c1808; --line:#4c3018; --fg:#f5d8a8; --muted:#a8835a; --accent:#f97316; --accent-ink:#1c0e04; --danger:#d63d3d; --ok:#a8be58; }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; }
+    header { display: flex; align-items: center; gap: 1.25rem; padding: .75rem 1rem; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; padding-right: .75rem; border-right: 1px solid var(--line); }
+    header a { color: var(--muted); text-decoration: none; font-size: .85rem; }
+    header a:hover { color: var(--accent); }
+    main { max-width: 64rem; padding: 1rem; margin: 0 auto; }
+    .flash { background: var(--card); border: 1px solid var(--accent); color: var(--fg); border-radius: 6px; padding: .55rem .75rem; font-size: .85rem; margin-bottom: 1rem; }
+    .group { background: var(--card); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 1rem; overflow: hidden; }
+    .group-header { padding: .55rem .8rem; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: .5rem; }
+    .group-header .label { font-weight: 600; }
+    .group-header .label.empty { color: var(--muted); font-style: italic; font-weight: 400; }
+    .group-header .count { color: var(--muted); font-size: .8rem; }
+    .row { display: grid; grid-template-columns: minmax(8rem, 1fr) auto auto; gap: .75rem; align-items: center; padding: .55rem .8rem; border-top: 1px solid var(--line); }
+    .row:first-of-type { border-top: 0; }
+    .row .name { font-family: ui-monospace, monospace; font-size: .85rem; }
+    .row .usage { color: var(--muted); font-size: .75rem; }
+    .row form { display: inline-flex; gap: .35rem; }
+    .row input[name="new_name"] { background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: .25rem .5rem; font: inherit; font-size: .8rem; min-width: 12rem; }
+    .row input[name="new_name"]:focus { outline: none; border-color: var(--accent); }
+    .row button { background: transparent; border: 1px solid var(--line); color: var(--muted); border-radius: 4px; padding: .22rem .55rem; font: inherit; font-size: .75rem; cursor: pointer; }
+    .row button:hover { color: var(--fg); border-color: var(--accent); }
+    .row button.danger { color: var(--danger); border-color: var(--line); }
+    .row button.danger:hover { background: var(--danger); color: var(--bg); border-color: var(--danger); }
+    .empty-state { color: var(--muted); padding: 2rem; text-align: center; }
+    .hint { color: var(--muted); font-size: .8rem; margin: 0 0 1rem; }
+    .create { display: flex; gap: .5rem; align-items: center; padding: .75rem; background: var(--card); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 1rem; }
+    .create input { flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: .35rem .55rem; font: inherit; font-size: .85rem; }
+    .create input:focus { outline: none; border-color: var(--accent); }
+    .create button { background: var(--accent); color: var(--accent-ink); border: 1px solid var(--accent); border-radius: 4px; padding: .35rem .85rem; font: inherit; font-size: .85rem; font-weight: 600; cursor: pointer; }
+    .create button:hover { filter: brightness(1.1); }
+    code { background: var(--card); padding: .05rem .25rem; border-radius: 3px; font-size: .9em; }
+  </style>
+</head>
+<body data-theme="licorice">
+  <script>
+    try { const t = localStorage.getItem('wytchr.theme'); if (t) document.body.setAttribute('data-theme', t); } catch (e) {}
+  </script>
+  <header>
+    <h1>wytchr · tags</h1>
+    <a href="/">← back to board</a>
+  </header>
+  <main>
+    {% if flash %}<div class="flash">{{ flash }}</div>{% endif %}
+    <p class="hint">
+      Create a tag here so it shows up in the filter bar before you've attached it anywhere.
+      Rename a tag to move it between groups: change <code>sport:mlb</code> → <code>topic:mlb</code> and the underlying references update everywhere.
+      Renaming to a name that already exists merges the two tags. Deleting drops the tag from every video and channel.
+    </p>
+    <form class="create" method="post" action="/tags/create">
+      <input type="text" name="name" placeholder="prefix:new-tag" maxlength="64" required autocomplete="off">
+      <button type="submit">create tag</button>
+    </form>
+    {% if grouped %}
+      {% for prefix, tags in grouped.items() %}
+        <section class="group">
+          <header class="group-header">
+            {% if prefix %}
+              <span class="label">{{ prefix }}</span>
+            {% else %}
+              <span class="label empty">(no prefix)</span>
+            {% endif %}
+            <span class="count">{{ tags|length }} tag{{ '' if tags|length == 1 else 's' }}</span>
+          </header>
+          {% for t in tags %}
+            <div class="row">
+              <div>
+                <span class="name">{{ t.name }}</span>
+                <span class="usage"> &middot; {{ t.video_count }} video{{ '' if t.video_count == 1 else 's' }} &middot; {{ t.channel_count }} channel{{ '' if t.channel_count == 1 else 's' }}</span>
+              </div>
+              <form method="post" action="/tags/{{ t.name }}/rename">
+                <input type="text" name="new_name" value="{{ t.name }}" maxlength="64" required>
+                <button type="submit">rename</button>
+              </form>
+              <form method="post" action="/tags/{{ t.name }}/delete"
+                    onsubmit="return confirm('Delete tag &quot;{{ t.name }}&quot; from {{ t.video_count }} video(s) and {{ t.channel_count }} channel(s)?')">
+                <button type="submit" class="danger">delete</button>
+              </form>
+            </div>
+          {% endfor %}
+        </section>
+      {% endfor %}
+    {% else %}
+      <div class="empty-state">No tags yet. Add some from the board.</div>
+    {% endif %}
+  </main>
+</body>
+</html>

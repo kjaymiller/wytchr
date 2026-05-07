@@ -1,0 +1,60 @@
+<article class="card" data-status="{{ v.status }}" id="card-{{ v.video_id }}">
+  {% if v.thumbnail_url %}
+    <a href="{{ v.url }}" target="_blank" rel="noopener">
+      <img class="thumb" src="{{ v.thumbnail_url }}" alt="" loading="lazy">
+    </a>
+  {% endif %}
+  <div class="title">
+    <a href="{{ v.url }}" target="_blank" rel="noopener">{{ v.title or v.video_id }}</a>
+  </div>
+  <div class="meta">
+    <span>
+      {%- if v.upload_date and v.upload_date|length == 8 -%}
+        {{ v.upload_date[:4] }}-{{ v.upload_date[4:6] }}-{{ v.upload_date[6:8] }}
+      {%- elif v.upload_date -%}
+        {{ v.upload_date }}
+      {%- else -%}—{%- endif -%}
+    </span>
+    <span>
+      {%- if v.duration -%}
+        {%- set m = (v.duration // 60) -%}{%- set s = (v.duration % 60) -%}
+        {{ m }}:{{ '%02d' % s }}
+      {%- endif -%}
+    </span>
+    <span class="badge {{ v.status }}">{{ v.status }}</span>
+  </div>
+  {% with tags = video_tags_map.get(v.video_id, []), video_id = v.video_id %}
+    {% include "_tags_video.html" %}
+  {% endwith %}
+  <div class="actions">
+    {% if v.status == 'new' or v.status == 'failed' %}
+      <button class="icon-btn dl"
+              hx-post="/videos/{{ v.video_id }}/download"
+              hx-target="#card-{{ v.video_id }}"
+              hx-swap="outerHTML"
+              hx-disabled-elt="this"
+              hx-confirm="{% if v.status == 'failed' %}Retry download?{% else %}{% endif %}"
+              title="{% if v.status == 'failed' %}retry download{% else %}download{% endif %}">↓</button>
+      <button class="icon-btn"
+              hx-post="/videos/{{ v.video_id }}/watched"
+              hx-target="#card-{{ v.video_id }}"
+              hx-swap="outerHTML"
+              title="mark as watched on YouTube">watched</button>
+      <button class="icon-btn"
+              hx-post="/videos/{{ v.video_id }}/hide"
+              hx-target="#card-{{ v.video_id }}"
+              hx-swap="outerHTML"
+              title="hide">hide</button>
+    {% elif v.status == 'queued' or v.status == 'downloading' %}
+      <button disabled>downloading…</button>
+    {% elif v.status == 'done' %}
+      <button hx-post="/videos/{{ v.video_id }}/hide"
+              hx-target="#card-{{ v.video_id }}"
+              hx-swap="outerHTML">dismiss</button>
+    {% elif v.status == 'hidden' %}
+      <button hx-post="/videos/{{ v.video_id }}/unhide"
+              hx-target="#card-{{ v.video_id }}"
+              hx-swap="outerHTML">unhide</button>
+    {% endif %}
+  </div>
+</article>

@@ -1,0 +1,898 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>wytchr</title>
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <script src="https://unpkg.com/sortablejs@1.15.6/Sortable.min.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+
+    /* Black licorice (default): wine-black base, cream-sugar text,
+       Good & Plenty pink, anise violet. */
+    body, body[data-theme="licorice"] {
+      --bg: #0a060d;
+      --bg-deep: #050309;
+      --card: #15101a;
+      --card-soft: #1d1626;
+      --line: #2d2238;
+      --line-bright: #3d2f4d;
+      --fg: #f3e9e6;
+      --muted: #8a7d8a;
+      --accent: #ff5f87;
+      --accent-ink: #1a0a14;
+      --accent-soft: rgba(255, 95, 135, 0.13);
+      --secondary: #c9a9f0;
+      --secondary-soft: rgba(201, 169, 240, 0.13);
+      --danger: #f25b5b;
+      --danger-soft: rgba(242, 91, 91, 0.1);
+      --ok: #b8e0a3;
+      --ok-soft: rgba(184, 224, 163, 0.13);
+    }
+
+    /* Marmite: black yeast paste, label yellow + red. Love it or hate it. */
+    body[data-theme="marmite"] {
+      --bg: #14100a;
+      --bg-deep: #0a0805;
+      --card: #221a10;
+      --card-soft: #2e2316;
+      --line: #3d2f1d;
+      --line-bright: #524026;
+      --fg: #f7e7a8;
+      --muted: #a89568;
+      --accent: #f5c518;
+      --accent-ink: #1a1208;
+      --accent-soft: rgba(245, 197, 24, 0.14);
+      --secondary: #c8341c;
+      --secondary-soft: rgba(200, 52, 28, 0.16);
+      --danger: #d63d3d;
+      --danger-soft: rgba(214, 61, 61, 0.12);
+      --ok: #9bc053;
+      --ok-soft: rgba(155, 192, 83, 0.13);
+    }
+
+    /* See's Candies: dark chocolate base, cream box, caramel-gold trim. */
+    body[data-theme="sees"] {
+      --bg: #14100c;
+      --bg-deep: #08060a;
+      --card: #221a14;
+      --card-soft: #2e2218;
+      --line: #3d2e22;
+      --line-bright: #50402f;
+      --fg: #f5ebe0;
+      --muted: #a89578;
+      --accent: #d4a574;
+      --accent-ink: #14100c;
+      --accent-soft: rgba(212, 165, 116, 0.14);
+      --secondary: #b8443e;
+      --secondary-soft: rgba(184, 68, 62, 0.14);
+      --danger: #c84545;
+      --danger-soft: rgba(200, 69, 69, 0.12);
+      --ok: #9aae6a;
+      --ok-soft: rgba(154, 174, 106, 0.13);
+    }
+
+    /* Jaffa Cakes: dark chocolate, sponge tan, bright orange jelly. */
+    body[data-theme="jaffa"] {
+      --bg: #1c0e04;
+      --bg-deep: #0e0702;
+      --card: #2c1808;
+      --card-soft: #3a2310;
+      --line: #4c3018;
+      --line-bright: #5e3f1f;
+      --fg: #f5d8a8;
+      --muted: #a8835a;
+      --accent: #f97316;
+      --accent-ink: #1c0e04;
+      --accent-soft: rgba(249, 115, 22, 0.14);
+      --secondary: #d4842b;
+      --secondary-soft: rgba(212, 132, 43, 0.14);
+      --danger: #d63d3d;
+      --danger-soft: rgba(214, 61, 61, 0.12);
+      --ok: #a8be58;
+      --ok-soft: rgba(168, 190, 88, 0.13);
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+    header { display: flex; align-items: center; gap: 1.25rem; padding: .75rem 1rem; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 10; }
+    header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; letter-spacing: .02em; padding-right: .75rem; border-right: 1px solid var(--line); }
+    header .meta { color: var(--muted); font-size: .85rem; }
+    header .spacer { flex: 1; }
+    header .controls { display: flex; align-items: center; gap: .75rem; }
+    button, .btn { background: var(--card); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: .35rem .65rem; cursor: pointer; font: inherit; }
+    button:hover { border-color: var(--accent); }
+    button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+    button.primary:hover { background: #ff7a9e; border-color: #ff7a9e; }
+    button.danger { color: var(--danger); }
+    .toggle { color: var(--muted); text-decoration: none; }
+    .toggle:hover { color: var(--accent); }
+    .theme-picker {
+      background: var(--card); color: var(--muted); border: 1px solid var(--line);
+      border-radius: 4px; padding: .25rem .5rem; font: inherit; font-size: .8rem;
+      cursor: pointer;
+    }
+    .theme-picker:hover, .theme-picker:focus { color: var(--fg); border-color: var(--accent); outline: none; }
+    .channel-search {
+      background: var(--card); color: var(--fg);
+      border: 1px solid var(--line); border-radius: 4px;
+      padding: .25rem .5rem; font: inherit; font-size: .8rem;
+      width: 11rem;
+    }
+    .channel-search::placeholder { color: var(--muted); }
+    .channel-search:hover, .channel-search:focus { border-color: var(--accent); outline: none; }
+    .setting-toggle { display: inline-flex; align-items: center; gap: .35rem; color: var(--muted); font-size: .8rem; cursor: pointer; user-select: none; }
+    .setting-toggle:hover { color: var(--fg); }
+    .setting-toggle input { accent-color: var(--accent); cursor: pointer; }
+    .settings-wrap { position: relative; }
+    .settings-btn {
+      background: var(--card); color: var(--muted);
+      border: 1px solid var(--line); border-radius: 4px;
+      padding: .25rem .5rem; font: inherit; font-size: .9rem;
+      cursor: pointer; line-height: 1;
+    }
+    .settings-btn:hover, .settings-btn[aria-expanded="true"] { color: var(--fg); border-color: var(--accent); }
+    #settings-panel {
+      position: absolute; top: calc(100% + .35rem); right: 0;
+      background: var(--card); border: 1px solid var(--line);
+      border-radius: 6px; padding: .55rem .65rem;
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+      min-width: 12rem; z-index: 20;
+      display: flex; flex-direction: column; gap: .35rem;
+    }
+    #settings-panel[hidden] { display: none; }
+    .section[data-search-empty="1"] { display: none; }
+    main { padding: 1rem; }
+    .stats { display: flex; flex-wrap: wrap; gap: 0 1.25rem; padding: .25rem .25rem 1rem; color: var(--muted); font-size: .85rem; align-items: baseline; }
+    .stats strong { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .stats .hot strong { color: var(--accent); }
+    .stats .bad strong { color: var(--danger); }
+    .stats .muted strong { color: var(--muted); }
+    /* Sectioned layout: one block per profile, with the channel
+       columns inside laid out as multi-column flow. SortableJS
+       lets the operator drag channels between sections to
+       reassign their profile upstream. */
+    .sections { display: flex; flex-direction: column; gap: 1.25rem; }
+    .section { border: 1px solid var(--line); border-radius: 10px; padding: .75rem; background: rgba(255, 255, 255, .015); }
+    .section-header { display: flex; align-items: baseline; gap: .75rem; padding: 0 .25rem .65rem; border-bottom: 1px solid var(--line); margin-bottom: .75rem; }
+    .section-title { margin: 0; font-size: .95rem; font-weight: 700; letter-spacing: .03em; text-transform: uppercase; color: var(--accent); font-family: ui-monospace, monospace; }
+    .section-title.muted { color: var(--muted); font-style: italic; text-transform: none; letter-spacing: 0; font-weight: 500; }
+    .section-count { color: var(--muted); font-size: .75rem; margin-left: auto; }
+    .empty-section { color: var(--muted); font-size: .8rem; padding: 1rem; text-align: center; border: 1px dashed var(--line); border-radius: 6px; margin: 0; font-style: italic; }
+    .sortable-ghost { opacity: 0.4; }
+    .sortable-drag { box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4); cursor: grabbing; }
+    .drag-handle {
+      color: var(--muted); cursor: grab; user-select: none;
+      font-family: monospace; font-size: .9rem; line-height: 1;
+      padding: 0 .15rem; flex-shrink: 0;
+      letter-spacing: -.15em;
+    }
+    .drag-handle { margin-right: .15rem; }
+    .drag-handle:hover { color: var(--accent); }
+    .drag-handle:focus { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+    .drag-handle:active { cursor: grabbing; }
+    #move-popup {
+      position: absolute; z-index: 50;
+      background: var(--card); border: 1px solid var(--accent);
+      border-radius: 6px; padding: .35rem;
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+      display: none; min-width: 11rem;
+    }
+    #move-popup[data-open="true"] { display: block; }
+    #move-popup .header { color: var(--muted); font-size: .7rem; padding: .15rem .35rem .35rem; border-bottom: 1px solid var(--line); margin-bottom: .25rem; }
+    .profile-slot {
+      display: flex; align-items: center;
+      padding: .45rem .65rem;
+      border: 1px dashed var(--line); border-radius: 6px;
+      margin: .2rem 0;
+      color: var(--fg); font-size: .82rem;
+      font-family: ui-monospace, monospace;
+      cursor: pointer;
+      transition: background .12s, border-color .12s, color .12s, transform .12s;
+      min-height: 1.9rem;
+    }
+    .profile-slot.target { border-style: dashed; }
+    .profile-slot.target:hover {
+      background: var(--accent); color: var(--accent-ink);
+      border-color: var(--accent); border-style: solid;
+    }
+    /* Drag-over feedback: SortableJS injects the ghost element into
+       whichever drop target the cursor is over. Use :has() to light
+       up that slot strongly so the operator sees exactly where the
+       channel will land. */
+    .profile-slot:has(.sortable-ghost) {
+      background: var(--accent); color: var(--accent-ink);
+      border-color: var(--accent); border-style: solid; border-width: 2px;
+      padding: calc(.45rem - 1px) calc(.65rem - 1px);
+      transform: scale(1.02);
+      box-shadow: 0 0 0 4px var(--accent-soft);
+    }
+    /* Hide the dragged column's contents while it's nested in a slot
+       — otherwise the slot expands to hold a full channel column and
+       the popup loses its compact layout. */
+    #move-popup .sortable-ghost {
+      display: block !important;
+      height: 0 !important; min-height: 0 !important;
+      padding: 0 !important; margin: 0 !important;
+      border: none !important; overflow: hidden !important;
+    }
+    .profile-slot.current { color: var(--muted); cursor: default; opacity: .55; border-style: solid; }
+    .profile-slot.current:hover { background: transparent; }
+    .rows { display: flex; flex-direction: column; gap: .65rem; min-height: 3rem; }
+    .channel-row {
+      display: flex; align-items: stretch; gap: 0;
+      background: var(--card); border: 1px solid var(--line);
+      border-radius: 8px; overflow: hidden;
+    }
+    .channel-head {
+      flex: 0 0 240px; min-width: 0;
+      padding: .55rem .75rem;
+      border-right: 1px solid var(--line);
+      background: var(--card);
+      display: flex; flex-direction: column; gap: .3rem;
+      align-self: stretch;
+    }
+    .channel-head .summary-row { display: flex; align-items: baseline; gap: .4rem; min-width: 0; }
+    .channel-head .summary-row .title { font-size: .9rem; font-weight: 600; color: var(--fg); text-decoration: none; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .channel-head .summary-row .title:hover { color: var(--accent); }
+    .row-settings { color: var(--muted); text-decoration: none; font-size: .9rem; line-height: 1; padding: 0 .15rem; flex-shrink: 0; }
+    .row-settings:hover { color: var(--accent); }
+    #poll-toast {
+      position: fixed; bottom: 1rem; right: 1rem; z-index: 60;
+      background: var(--card); border: 1px solid var(--accent);
+      color: var(--fg); border-radius: 8px;
+      padding: .65rem .85rem; font-size: .85rem;
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+      max-width: 28rem;
+      transition: opacity .25s ease;
+    }
+    #poll-toast[hidden] { display: none; }
+    #poll-toast .summary-line { display: flex; gap: .85rem; align-items: baseline; flex-wrap: wrap; }
+    #poll-toast strong { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 600; }
+    #poll-toast .errs { color: var(--danger); font-size: .78rem; }
+    #poll-toast .errs ul { margin: .25rem 0 0; padding: 0 0 0 1rem; max-height: 6rem; overflow-y: auto; }
+    #poll-toast .close { float: right; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 1rem; line-height: 1; padding: 0 .15rem; margin-left: .5rem; }
+    #poll-toast .close:hover { color: var(--fg); }
+    #poll-toast.fading { opacity: 0; }
+    .channel-head .counts { color: var(--muted); font-size: .72rem; }
+    .channel-head .counts strong { color: var(--accent); font-weight: 600; }
+    .channel-head .counts .muted { color: var(--muted); }
+    .channel-head .err { color: var(--danger); font-size: .7rem; padding: .25rem .4rem; border-radius: 4px; background: var(--danger-soft); margin-top: auto; }
+    .videos {
+      flex: 1; min-width: 0;
+      display: flex; flex-direction: row;
+      gap: .5rem; padding: .5rem;
+      overflow-x: auto; overflow-y: hidden;
+      scroll-snap-type: x proximity;
+      scrollbar-width: thin;
+    }
+    .videos::-webkit-scrollbar { height: 8px; }
+    .videos::-webkit-scrollbar-thumb { background: var(--line-bright); border-radius: 4px; }
+    .videos-empty { color: var(--muted); font-size: .8rem; padding: .75rem .5rem; margin: 0; align-self: center; }
+    .card {
+      display: flex; flex-direction: column; gap: .35rem;
+      padding: .5rem; border: 1px solid var(--line);
+      border-radius: 6px; background: var(--card-soft);
+      flex: 0 0 220px; width: 220px;
+      scroll-snap-align: start;
+    }
+    .card[data-status="done"] { opacity: .55; }
+    .card[data-status="failed"] { border-color: var(--danger); }
+    .card[data-status="queued"], .card[data-status="downloading"] { border-color: var(--accent); }
+    .card .thumb { width: 100%; aspect-ratio: 16/9; background: var(--bg-deep); border-radius: 4px; object-fit: cover; }
+    .card .title { font-weight: 500; font-size: .9rem; line-height: 1.3; }
+    .card .title a { color: var(--fg); text-decoration: none; }
+    .card .title a:hover { color: var(--accent); }
+    .card .meta { display: flex; justify-content: space-between; color: var(--muted); font-size: .75rem; }
+    .card .actions { display: flex; gap: .3rem; margin-top: .25rem; align-items: center; }
+    .card .actions .icon-btn {
+      background: transparent; color: var(--muted);
+      border: 1px solid var(--line); border-radius: 4px;
+      font: inherit; font-size: .72rem; line-height: 1;
+      padding: .2rem .45rem; cursor: pointer;
+      transition: color .12s, border-color .12s, background .12s;
+    }
+    .card .actions .icon-btn:hover { color: var(--fg); border-color: var(--accent); }
+    .card .actions .icon-btn.dl {
+      flex: 0 0 auto; padding: .2rem .35rem;
+      color: var(--accent); border-color: var(--accent-soft);
+      font-weight: 600; font-size: .85rem;
+    }
+    .card .actions .icon-btn.dl:hover { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+    .card .actions > .icon-btn:not(.dl) { flex: 1; text-align: center; }
+    .badge { display: inline-block; padding: .05rem .4rem; border-radius: 3px; font-size: .7rem; text-transform: uppercase; letter-spacing: .04em; }
+    .badge.new { background: var(--accent-soft); color: var(--accent); }
+    .badge.queued, .badge.downloading { background: var(--secondary-soft); color: var(--secondary); }
+    .badge.done { background: var(--ok-soft); color: var(--ok); }
+    .badge.failed { background: var(--danger-soft); color: var(--danger); }
+    .badge.hidden { background: rgba(138, 125, 138, 0.18); color: var(--muted); }
+    .htmx-indicator { display: none; color: var(--muted); }
+    .htmx-request .htmx-indicator { display: inline; }
+
+    /* Tags + filter chips */
+    .filter-bar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .75rem; padding: 0 .25rem 1rem; }
+    .filter-label { color: var(--muted); font-size: .8rem; }
+    .filter-group { display: inline-flex; flex-wrap: wrap; align-items: center; gap: .3rem; padding: .15rem .5rem .15rem .15rem; border: 1px dashed var(--line); border-radius: 999px; }
+    .filter-group-label { color: var(--muted); font-size: .65rem; text-transform: uppercase; letter-spacing: .05em; padding: 0 .35rem 0 .5rem; }
+    .filter-manage { color: var(--muted); font-size: .75rem; text-decoration: none; padding: .12rem .55rem; border: 1px dashed transparent; border-radius: 999px; }
+    .filter-manage:hover { color: var(--accent); border-color: var(--line); }
+    .tag-chip { display: inline-flex; align-items: center; gap: .35rem; padding: .12rem .55rem; border: 1px solid var(--line); border-radius: 999px; color: var(--fg); text-decoration: none; font-size: .75rem; background: transparent; transition: border-color .12s, color .12s; }
+    .tag-chip:hover { border-color: var(--accent); color: var(--accent); }
+    .tag-chip.active { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+    .tag-chip .tag-count { color: var(--muted); font-size: .7rem; }
+    .tag-chip.active .tag-count { color: rgba(26, 10, 20, .65); }
+
+    .tags { display: flex; flex-wrap: wrap; gap: .25rem; align-items: center; }
+    .card .tags { padding-top: .15rem; }
+    .channel-tags { padding-top: .1rem; }
+    .tag {
+      display: inline-flex; align-items: center;
+      padding: 0 .1rem 0 .55rem;
+      border: 1px solid var(--line); border-radius: 999px;
+      font-size: .7rem; line-height: 1.6;
+      color: var(--muted); background: transparent;
+      transition: border-color .12s, color .12s;
+    }
+    .tag:hover { border-color: var(--accent); color: var(--fg); }
+    .tag .tag-link { color: inherit; text-decoration: none; }
+    .tag .tag-x {
+      background: none; border: none; color: transparent;
+      padding: 0 .35rem; font-size: .85rem; line-height: 1;
+      cursor: pointer; transition: color .12s;
+    }
+    .tag:hover .tag-x { color: var(--muted); }
+    .tag .tag-x:hover { color: var(--danger); }
+
+    /* Click-to-edit: "+" button is always shown; clicking it adds
+       .editing on the parent .tags, which swaps the button out for
+       the input form. Blurring the input removes .editing.    */
+    .tag-edit-btn {
+      background: transparent; border: 1px dashed var(--line);
+      border-radius: 999px; color: var(--muted);
+      font: inherit; font-size: .75rem; line-height: 1.4;
+      padding: 0 .55rem; cursor: pointer;
+      transition: color .12s, border-color .12s;
+    }
+    .tag-edit-btn:hover { color: var(--accent); border-color: var(--accent); }
+    .tag-add { display: none; align-items: center; }
+    .tags.editing .tag-add { display: inline-flex; }
+    .tags.editing .tag-edit-btn { display: none; }
+    .tag-add input {
+      background: transparent;
+      border: 1px solid var(--accent);
+      border-radius: 999px;
+      color: var(--fg); font: inherit; font-size: .75rem;
+      padding: 0 .55rem; line-height: 1.6;
+      width: 8rem;
+    }
+    .tag-add input::placeholder { color: var(--muted); opacity: .65; }
+    .tag-add input:focus { outline: none; }
+  </style>
+</head>
+<body data-theme="licorice">
+  <script>
+    // Apply persisted theme before paint to avoid a flash. Falls back
+    // silently if localStorage isn't available (private mode).
+    (function() {
+      try {
+        const t = localStorage.getItem('wytchr.theme');
+        if (t) document.body.setAttribute('data-theme', t);
+      } catch (e) {}
+    })();
+  </script>
+  <header>
+    <h1>wytchr</h1>
+    <span class="meta">auto-poll every {{ poll_interval }}m</span>
+    <span class="spacer"></span>
+    <div class="controls">
+      <input id="channel-search" type="search" placeholder="search channels…"
+             aria-label="filter channels by name (fuzzy)"
+             autocomplete="off" spellcheck="false" class="channel-search">
+      <select id="theme-picker" aria-label="theme" class="theme-picker">
+        <optgroup label="Confections">
+          <option value="licorice">black licorice</option>
+          <option value="sees">see's candies</option>
+          <option value="jaffa">jaffa cakes</option>
+        </optgroup>
+        <optgroup label="Spreads">
+          <option value="marmite">marmite</option>
+        </optgroup>
+      </select>
+      <a class="toggle" href="?hidden=1" id="hidden-toggle">show hidden</a>
+      <div class="settings-wrap">
+        <button id="settings-btn" type="button" class="settings-btn"
+                aria-haspopup="true" aria-expanded="false"
+                aria-controls="settings-panel" title="settings">⚙</button>
+        <div id="settings-panel" role="menu" hidden>
+          <label class="setting-toggle" title="clicking a thumbnail or title also marks the video as watched">
+            <input type="checkbox" id="click-to-watch">
+            <span>click to watch</span>
+          </label>
+        </div>
+      </div>
+      <button hx-post="/poll/all" hx-target="#board" hx-swap="innerHTML"
+              hx-indicator="#poll-spin">
+        refresh now <span id="poll-spin" class="htmx-indicator">…</span>
+      </button>
+    </div>
+  </header>
+  <main>
+    <div id="board"
+         hx-get="/board{{ ('?' ~ request.query_string.decode()) if request.query_string else '' }}"
+         hx-trigger="load, every 30s [shouldAutoPoll()]"
+         hx-swap="innerHTML">
+      loading…
+    </div>
+  </main>
+  <div id="move-popup" role="menu" aria-label="move channel to profile"></div>
+  <div id="poll-toast" role="status" aria-live="polite" hidden></div>
+  <script>
+    // Move popup: opens on drag-start AND on click of the drag
+    // handle. Each profile is rendered as a Sortable drop target so
+    // the user can drop the dragged card directly into the popup.
+    // Click on a slot routes through the same move() helper.
+    (function() {
+      const popup = document.getElementById('move-popup');
+      let activeChannel = null;
+      let activeFrom = null;
+      let openedByDrag = false;
+      // Set true while the slot's onAdd is committing a move so the
+      // source's onEnd doesn't double-fire its own move logic.
+      window.__movingViaPopup = false;
+
+      function profilesFromDom() {
+        const set = new Set();
+        document.querySelectorAll('.sortable-columns').forEach((el) => {
+          set.add(el.dataset.profile || '');
+        });
+        return [...set];
+      }
+
+      function close() {
+        popup.removeAttribute('data-open');
+        popup.innerHTML = '';
+        activeChannel = null;
+        activeFrom = null;
+        openedByDrag = false;
+      }
+
+      function open(channelName, fromProfile, anchorRect, fromDrag) {
+        activeChannel = channelName;
+        activeFrom = fromProfile;
+        openedByDrag = !!fromDrag;
+
+        const header = document.createElement('div');
+        header.className = 'header';
+        header.textContent = fromDrag ? 'drop into…' : 'move to…';
+        popup.innerHTML = '';
+        popup.appendChild(header);
+
+        for (const p of profilesFromDom()) {
+          const slot = document.createElement('div');
+          slot.className = 'profile-slot';
+          slot.dataset.profile = p;
+          const label = p || '(no profile)';
+          slot.textContent = label + (p === fromProfile ? ' ✓' : '');
+          if (p === fromProfile) {
+            slot.classList.add('current');
+          } else {
+            slot.classList.add('target');
+            // Drop target: same Sortable group as the section
+            // columns, so the dragged card can transition into the
+            // slot mid-drag. `pull: false` because we never want
+            // anything dragged OUT of the popup.
+            Sortable.create(slot, {
+              group: { name: 'channels', put: true, pull: false },
+              animation: 150,
+              swapThreshold: 0.65,
+              ghostClass: 'sortable-ghost',
+              // Empty-by-default slot — make any pointer entry count
+              // as a hover so the highlight kicks in immediately.
+              emptyInsertThreshold: 12,
+              onAdd: handleSlotDrop,
+            });
+          }
+          popup.appendChild(slot);
+        }
+
+        // Anchor next to the originating element (handle or card).
+        // Flip vertically if the popup would overflow the viewport.
+        const r = anchorRect;
+        const popupHeight = 30 + 36 * (profilesFromDom().length);
+        let top = window.scrollY + r.top;
+        let left = window.scrollX + r.right + 12;
+        if (r.right + 12 + 220 > window.innerWidth) {
+          left = window.scrollX + r.left - 220;
+        }
+        if (r.top + popupHeight + 16 > window.innerHeight + window.scrollY) {
+          top = Math.max(window.scrollY + 8, window.scrollY + window.innerHeight - popupHeight - 16);
+        }
+        popup.style.top = top + 'px';
+        popup.style.left = left + 'px';
+        popup.setAttribute('data-open', 'true');
+      }
+
+      async function handleSlotDrop(evt) {
+        const toProfile = evt.to.dataset.profile || '';
+        const card = evt.item;
+        const channel = card.dataset.channel;
+        const fromProfile = activeFrom;
+        // The dragged element ended up nested inside the popup.
+        // Yank it out so the popup doesn't briefly contain a
+        // channel column. The board refresh below repaints anyway.
+        card.remove();
+        window.__movingViaPopup = true;
+        await commitMove(channel, fromProfile, toProfile);
+        window.__movingViaPopup = false;
+      }
+
+      async function commitMove(channel, fromProfile, toProfile) {
+        close();
+        if (toProfile === fromProfile) {
+          refreshBoard();
+          return;
+        }
+        const display = (s) => s || '(no profile)';
+        if (!confirm(`Move ${channel} from ${display(fromProfile)} to ${display(toProfile)}?`)) {
+          refreshBoard();
+          return;
+        }
+        try {
+          const r = await fetch(`/channels/${encodeURIComponent(channel)}/profile`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ profile: toProfile }),
+          });
+          if (!r.ok) {
+            const body = await r.json().catch(() => ({}));
+            alert(`Move failed: ${body.error || r.status}`);
+          }
+        } catch (err) {
+          alert(`Move failed: ${err.message}`);
+        }
+        refreshBoard();
+      }
+
+      // Click on the drag handle opens the popup at the handle.
+      // (SortableJS suppresses click when an actual drag occurred,
+      // so this only fires on a no-movement click.)
+      document.body.addEventListener('click', (e) => {
+        const handle = e.target.closest('.drag-handle');
+        if (handle) {
+          e.preventDefault();
+          e.stopPropagation();
+          const card = handle.closest('.channel-row');
+          if (!card) return;
+          const isOpenForThis =
+            popup.getAttribute('data-open') === 'true'
+            && activeChannel === card.dataset.channel;
+          if (isOpenForThis) {
+            close();
+          } else {
+            open(card.dataset.channel, card.dataset.profile || '',
+                 handle.getBoundingClientRect(), false);
+          }
+          return;
+        }
+        // Click on a popup slot in click-mode (not drag): treat
+        // like a target pick.
+        const slot = e.target.closest('#move-popup .profile-slot.target');
+        if (slot && popup.getAttribute('data-open') === 'true' && !openedByDrag) {
+          commitMove(activeChannel, activeFrom, slot.dataset.profile || '');
+          return;
+        }
+        // Any click outside the popup closes it.
+        if (popup.getAttribute('data-open') === 'true' && !e.target.closest('#move-popup')) {
+          close();
+        }
+      });
+      // Keyboard: Enter / Space on a focused handle opens the popup.
+      document.body.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        const handle = e.target.closest && e.target.closest('.drag-handle');
+        if (!handle) return;
+        e.preventDefault();
+        const card = handle.closest('.channel-row');
+        if (!card) return;
+        open(card.dataset.channel, card.dataset.profile || '',
+             handle.getBoundingClientRect(), false);
+      });
+
+      // Drag-start: SortableJS fires this via dispatched event
+      // (see wireSortables onStart). We open the popup with drop
+      // slots, anchored to the dragged card.
+      document.body.addEventListener('wytchr:drag-start', (e) => {
+        const { channel, fromProfile, rect } = e.detail;
+        open(channel, fromProfile, rect, true);
+      });
+      document.body.addEventListener('wytchr:drag-end', () => {
+        // If the drag ended in the popup we already closed via
+        // commitMove; otherwise, dismiss the popup since the drag
+        // is over.
+        if (openedByDrag) close();
+      });
+
+      window.addEventListener('resize', close);
+      // Don't auto-close on scroll during drag — autoscroll would
+      // dismiss the popup as the operator drags toward the edge.
+      window.addEventListener('scroll', () => {
+        if (!openedByDrag) close();
+      }, { passive: true });
+    })();
+
+    // SortableJS: dragging a channel column between profile
+    // sections kicks off DELETE+POST against ytdl-sub-api via the
+    // wytchr orchestration route. Confirms before firing the
+    // re-subscribe so an accidental drag is recoverable.
+    function wireSortables() {
+      document.querySelectorAll('.sortable-columns').forEach((el) => {
+        if (el.__sortableWired) return;
+        el.__sortableWired = true;
+        Sortable.create(el, {
+          // Sections can be PULLED FROM but not dropped INTO. The
+          // only drop targets are the popup slots, which spin up
+          // their own Sortable instances on drag start. This kills
+          // the ambiguous-drop-zone behavior where SortableJS would
+          // otherwise default a release-in-empty-space into the
+          // first matching container (typically the topmost section).
+          group: { name: 'channels', pull: true, put: false },
+          animation: 150,
+          handle: '.drag-handle',
+          ghostClass: 'sortable-ghost',
+          dragClass: 'sortable-drag',
+          // Less twitchy intra-drag movement: require the cursor to
+          // actually be over a target before swapping.
+          swapThreshold: 0.65,
+          // Don't auto-scroll the page during drag — operator's already
+          // in the popup, the source section doesn't need to move.
+          scroll: false,
+          onStart: (evt) => {
+            const card = evt.item;
+            document.body.dispatchEvent(new CustomEvent('wytchr:drag-start', {
+              detail: {
+                channel: card.dataset.channel,
+                fromProfile: card.dataset.profile || '',
+                rect: card.getBoundingClientRect(),
+              },
+            }));
+          },
+          onEnd: () => {
+            document.body.dispatchEvent(new CustomEvent('wytchr:drag-end'));
+            // No section-to-section path anymore; popup slots own
+            // the move. If the user released outside the popup,
+            // SortableJS auto-snaps the card back to its origin.
+          },
+        });
+      });
+    }
+    function refreshBoard() {
+      const qs = window.location.search.slice(1);
+      htmx.ajax('GET', '/board' + (qs ? '?' + qs : ''),
+                { target: '#board', swap: 'innerHTML' });
+    }
+    // Wire after each board swap so newly-rendered sections become
+    // sortable too.
+    document.body.addEventListener('htmx:afterSettle', wireSortables);
+    // Initial pass for the first /board response loaded by hx-trigger.
+    document.body.addEventListener('htmx:load', wireSortables);
+
+    // Fuzzy channel search: subsequence match on the channel name
+    // (case-insensitive). Empty query restores all columns. Sections
+    // whose every column is hidden collapse out of the layout.
+    (function() {
+      const input = document.getElementById('channel-search');
+      function fuzzy(query, target) {
+        if (!query) return true;
+        let i = 0;
+        for (let j = 0; j < target.length && i < query.length; j++) {
+          if (target.charCodeAt(j) === query.charCodeAt(i)) i++;
+        }
+        return i === query.length;
+      }
+      function applyFilter() {
+        const q = (input.value || '').trim().toLowerCase();
+        document.querySelectorAll('.section').forEach((section) => {
+          let any = false;
+          section.querySelectorAll('.channel-row[data-channel]').forEach((col) => {
+            const name = (col.dataset.channel || '').toLowerCase();
+            const match = fuzzy(q, name);
+            col.style.display = match ? '' : 'none';
+            if (match) any = true;
+          });
+          if (q && !any) section.setAttribute('data-search-empty', '1');
+          else section.removeAttribute('data-search-empty');
+        });
+      }
+      input.addEventListener('input', applyFilter);
+      // Reapply after every board swap so re-rendered columns stay filtered.
+      document.body.addEventListener('htmx:afterSettle', applyFilter);
+    })();
+
+    // Poll-summary toast: /poll/all returns an HX-Trigger header with
+    // `wytchr:polled` carrying {channels, new_videos, errors[], elapsed_seconds}.
+    // Renders a banner bottom-right; auto-dismisses unless there were
+    // errors (those stick until manually closed).
+    (function() {
+      const toast = document.getElementById('poll-toast');
+      let dismissTimer = null;
+      function close() {
+        if (dismissTimer) { clearTimeout(dismissTimer); dismissTimer = null; }
+        toast.classList.remove('fading');
+        toast.hidden = true;
+        toast.innerHTML = '';
+      }
+      function escape(s) {
+        return String(s).replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+      }
+      document.body.addEventListener('wytchr:polled', (e) => {
+        const s = e.detail || {};
+        const errs = Array.isArray(s.errors) ? s.errors : [];
+        const parts = [
+          `<strong>${s.channels ?? 0}</strong> channels`,
+          `<strong>${s.new_videos ?? 0}</strong> new`,
+          `<strong>${(s.elapsed_seconds ?? 0).toFixed ? s.elapsed_seconds.toFixed(1) : s.elapsed_seconds}s</strong> elapsed`,
+        ];
+        if (errs.length) parts.push(`<span class="errs"><strong style="color:var(--danger)">${errs.length}</strong> errors</span>`);
+        let html = `<button class="close" type="button" aria-label="dismiss">×</button>`;
+        html += `<div class="summary-line">${parts.join(' · ')}</div>`;
+        if (errs.length) {
+          const items = errs.slice(0, 6).map((er) => `<li>${escape(er)}</li>`).join('');
+          const more = errs.length > 6 ? `<li>… and ${errs.length - 6} more</li>` : '';
+          html += `<div class="errs"><ul>${items}${more}</ul></div>`;
+        }
+        toast.innerHTML = html;
+        toast.hidden = false;
+        toast.classList.remove('fading');
+        toast.querySelector('.close').addEventListener('click', close);
+        if (dismissTimer) clearTimeout(dismissTimer);
+        // Errors stick — operator should see them; clean runs auto-fade.
+        if (!errs.length) {
+          dismissTimer = setTimeout(() => {
+            toast.classList.add('fading');
+            setTimeout(close, 280);
+          }, 4500);
+        }
+      });
+    })();
+
+    // Settings panel: small dropdown anchored to the gear button.
+    // Click-outside / Escape closes it.
+    (function() {
+      const btn = document.getElementById('settings-btn');
+      const panel = document.getElementById('settings-panel');
+      function setOpen(open) {
+        panel.hidden = !open;
+        btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      }
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        setOpen(panel.hidden);
+      });
+      document.addEventListener('click', (e) => {
+        if (panel.hidden) return;
+        if (e.target.closest('#settings-panel') || e.target === btn) return;
+        setOpen(false);
+      });
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && !panel.hidden) {
+          setOpen(false);
+          btn.focus();
+        }
+      });
+    })();
+
+    // Click-to-watch: when enabled, clicking a video's thumbnail or
+    // title link also POSTs /videos/<id>/watched in the background so
+    // the card flips to 'watched' on the next render. The link itself
+    // still opens (target=_blank), so navigation isn't blocked.
+    (function() {
+      const toggle = document.getElementById('click-to-watch');
+      const KEY = 'wytchr.clickToWatch';
+      let enabled = false;
+      try { enabled = localStorage.getItem(KEY) === '1'; } catch (e) {}
+      toggle.checked = enabled;
+      toggle.addEventListener('change', () => {
+        enabled = toggle.checked;
+        try { localStorage.setItem(KEY, enabled ? '1' : '0'); } catch (e) {}
+      });
+
+      document.body.addEventListener('click', (e) => {
+        if (!enabled) return;
+        const link = e.target.closest('.card a[href]');
+        if (!link) return;
+        const card = link.closest('.card');
+        if (!card) return;
+        const id = card.id && card.id.startsWith('card-') ? card.id.slice(5) : null;
+        if (!id) return;
+        // Only flip statuses where 'watched' is meaningful — matches
+        // the existing inline button's visibility (new / failed).
+        const status = card.dataset.status;
+        if (status !== 'new' && status !== 'failed') return;
+        // Fire-and-forget; the next board refresh swaps the card out.
+        // keepalive lets the request survive if the new tab steals focus.
+        fetch(`/videos/${encodeURIComponent(id)}/watched`, {
+          method: 'POST',
+          headers: { 'HX-Request': 'true' },
+          keepalive: true,
+        }).then(() => {
+          // Optimistic local removal so the card disappears immediately
+          // without waiting for the 30s auto-poll.
+          card.remove();
+        }).catch(() => {});
+      });
+    })();
+
+    // Click-to-edit tags: + → input → submit/blur → +
+    document.body.addEventListener('click', (e) => {
+      const btn = e.target.closest('.tag-edit-btn');
+      if (!btn) return;
+      const tags = btn.closest('.tags');
+      tags.classList.add('editing');
+      const inp = tags.querySelector('.tag-add input');
+      if (inp) inp.focus();
+    });
+    document.body.addEventListener('focusout', (e) => {
+      const inp = e.target.closest && e.target.closest('.tag-add input');
+      if (!inp) return;
+      // Defer so a click on the chip's × or the form submit lands first.
+      setTimeout(() => {
+        const tags = inp.closest('.tags');
+        if (tags && !tags.contains(document.activeElement)) {
+          tags.classList.remove('editing');
+        }
+      }, 120);
+    });
+
+    // Theme picker — persists to localStorage, no server roundtrip.
+    (function() {
+      const picker = document.getElementById('theme-picker');
+      const current = document.body.getAttribute('data-theme') || 'licorice';
+      picker.value = current;
+      picker.addEventListener('change', () => {
+        document.body.setAttribute('data-theme', picker.value);
+        try { localStorage.setItem('wytchr.theme', picker.value); } catch (e) {}
+      });
+    })();
+
+    // Don't clobber an in-progress tag-input with the 30s auto-poll.
+    // Trigger filter referenced in hx-trigger above.
+    function shouldAutoPoll() {
+      const ae = document.activeElement;
+      if (!ae) return true;
+      if (ae.matches('input, textarea, select, [contenteditable="true"]')) return false;
+      return true;
+    }
+
+    // "show hidden" toggle: build URL from current location so the
+    // active tag filter is preserved across toggles, then htmx-swap
+    // #board and pushState the new URL.
+    (function() {
+      const toggle = document.getElementById('hidden-toggle');
+      function syncLabel() {
+        const p = new URLSearchParams(window.location.search);
+        toggle.textContent = p.get('hidden') === '1' ? 'hide hidden' : 'show hidden';
+      }
+      toggle.addEventListener('click', (e) => {
+        e.preventDefault();
+        const p = new URLSearchParams(window.location.search);
+        if (p.get('hidden') === '1') p.delete('hidden');
+        else p.set('hidden', '1');
+        const qs = p.toString();
+        const url = qs ? '?' + qs : window.location.pathname;
+        htmx.ajax('GET', '/board' + (qs ? '?' + qs : ''),
+                  { target: '#board', swap: 'innerHTML' });
+        history.pushState(null, '', url);
+        syncLabel();
+      });
+      window.addEventListener('popstate', () => {
+        // Browser back/forward: re-fetch the board to match the URL.
+        const qs = window.location.search.slice(1);
+        htmx.ajax('GET', '/board' + (qs ? '?' + qs : ''),
+                  { target: '#board', swap: 'innerHTML' });
+        syncLabel();
+      });
+      syncLabel();
+    })();
+  </script>
+</body>
+</html>

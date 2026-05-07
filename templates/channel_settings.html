@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>wytchr · {{ channel.name }} settings</title>
+  <style>
+    :root { color-scheme: dark; }
+    body, body[data-theme="licorice"] { --bg:#0a060d; --card:#15101a; --line:#2d2238; --fg:#f3e9e6; --muted:#8a7d8a; --accent:#ff5f87; --accent-ink:#1a0a14; --danger:#f25b5b; --ok:#b8e0a3; }
+    body[data-theme="marmite"] { --bg:#14100a; --card:#221a10; --line:#3d2f1d; --fg:#f7e7a8; --muted:#a89568; --accent:#f5c518; --accent-ink:#1a1208; --danger:#d63d3d; --ok:#9bc053; }
+    body[data-theme="sees"] { --bg:#14100c; --card:#221a14; --line:#3d2e22; --fg:#f5ebe0; --muted:#a89578; --accent:#d4a574; --accent-ink:#14100c; --danger:#c84545; --ok:#9aae6a; }
+    body[data-theme="jaffa"] { --bg:#1c0e04; --card:#2c1808; --line:#4c3018; --fg:#f5d8a8; --muted:#a8835a; --accent:#f97316; --accent-ink:#1c0e04; --danger:#d63d3d; --ok:#a8be58; }
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; }
+    header { display: flex; align-items: center; gap: 1.25rem; padding: .75rem 1rem; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; padding-right: .75rem; border-right: 1px solid var(--line); }
+    header a { color: var(--muted); text-decoration: none; font-size: .85rem; }
+    header a:hover { color: var(--accent); }
+    main { max-width: 48rem; padding: 1rem; margin: 0 auto; }
+    .flash { background: var(--card); border: 1px solid var(--ok); color: var(--ok); border-radius: 6px; padding: .55rem .75rem; font-size: .85rem; margin-bottom: 1rem; }
+    .meta { color: var(--muted); font-size: .8rem; margin-bottom: 1rem; }
+    .meta code { background: var(--card); padding: .05rem .35rem; border-radius: 3px; font-size: .9em; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: .75rem 1rem; margin-bottom: 1rem; }
+    .card h2 { margin: 0 0 .5rem; font-size: .85rem; text-transform: uppercase; letter-spacing: .05em; color: var(--accent); font-weight: 700; }
+    .card .hint { color: var(--muted); font-size: .75rem; margin: 0 0 .65rem; }
+    .row { display: grid; grid-template-columns: 11rem 1fr; gap: .5rem .85rem; align-items: center; margin-bottom: .55rem; }
+    .row label { color: var(--muted); font-size: .82rem; }
+    .row .placeholder-note { color: var(--muted); font-size: .72rem; padding-left: .25rem; grid-column: 2; margin-top: -.35rem; }
+    input[type=text], input[type=number] {
+      background: var(--bg); color: var(--fg);
+      border: 1px solid var(--line); border-radius: 4px;
+      padding: .35rem .55rem; font: inherit; font-size: .85rem; width: 100%;
+    }
+    input[type=text]:focus, input[type=number]:focus { outline: none; border-color: var(--accent); }
+    .check-row { display: flex; align-items: center; gap: .4rem; padding: .25rem 0; }
+    .check-row input { accent-color: var(--accent); }
+    .check-row span { font-size: .85rem; }
+    .actions { display: flex; gap: .65rem; align-items: center; margin-top: .85rem; }
+    button { background: var(--accent); color: var(--accent-ink); border: 1px solid var(--accent); border-radius: 4px; padding: .4rem .85rem; cursor: pointer; font: inherit; font-size: .85rem; font-weight: 600; }
+    button:hover { filter: brightness(1.1); }
+    a.secondary { color: var(--muted); text-decoration: none; font-size: .85rem; }
+    a.secondary:hover { color: var(--accent); }
+  </style>
+</head>
+<body data-theme="licorice">
+<script>
+  try { const t = localStorage.getItem('wytchr.theme'); if (t) document.body.setAttribute('data-theme', t); } catch (e) {}
+</script>
+<header>
+  <h1>wytchr</h1>
+  <a href="/">board</a>
+  <a href="/tags">tags</a>
+  <a href="/presets">presets</a>
+</header>
+<main>
+  <h2 style="margin: 0 0 .25rem;">{{ channel.name }} settings</h2>
+  <p class="meta">
+    preset: <code>{{ channel.preset }}</code>
+    {% if profile_days or profile_max %}
+      · profile defaults:
+      {% if profile_days %}{{ profile_days }} days{% endif %}
+      {% if profile_days and profile_max %} · {% endif %}
+      {% if profile_max %}max {{ profile_max }}{% endif %}
+    {% endif %}
+  </p>
+  {% if saved %}<div class="flash">saved.</div>{% endif %}
+
+  <form method="post" action="/channels/{{ channel.name }}/settings">
+    <div class="card">
+      <h2>display</h2>
+      <p class="hint">leave blank to use the channel's real name.</p>
+      <div class="row">
+        <label for="display_name">display name</label>
+        <input type="text" id="display_name" name="display_name"
+               value="{{ settings.display_name or '' }}"
+               placeholder="{{ channel.name }}">
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>window overrides</h2>
+      <p class="hint">leave blank to inherit from the profile. examples: <code>14days</code>, <code>2weeks</code>, <code>6months</code>, <code>1year</code>.</p>
+      <div class="row">
+        <label for="date_range">date range</label>
+        <input type="text" id="date_range" name="date_range"
+               value="{{ settings.date_range or '' }}"
+               placeholder="{% if profile_days %}{{ profile_days }} days (profile default){% else %}—{% endif %}">
+      </div>
+      <div class="row">
+        <label for="max_files">max videos</label>
+        <input type="number" id="max_files" name="max_files" min="1"
+               value="{{ settings.max_files if settings.max_files is not none else '' }}"
+               placeholder="{% if profile_max %}{{ profile_max }} (profile default){% else %}—{% endif %}">
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>display toggles</h2>
+      <label class="check-row">
+        <input type="checkbox" name="include_shorts" {% if settings.include_shorts %}checked{% endif %}>
+        <span>include shorts (default: hidden)</span>
+      </label>
+      <label class="check-row">
+        <input type="checkbox" name="hide_channel" {% if settings.hide_channel %}checked{% endif %}>
+        <span>hide this channel from the board</span>
+      </label>
+    </div>
+
+    <div class="card">
+      <h2>auto-mark watched</h2>
+      <p class="hint">videos older than N days flip from <code>new</code>/<code>failed</code> to <code>watched</code> automatically. blank to disable.</p>
+      <div class="row">
+        <label for="auto_watched_days">days</label>
+        <input type="number" id="auto_watched_days" name="auto_watched_days" min="1"
+               value="{{ settings.auto_watched_days if settings.auto_watched_days is not none else '' }}">
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>title filters</h2>
+      <p class="hint">python regex, case-insensitive. include = only show matching; exclude = drop matching. blank = no filter.</p>
+      <div class="row">
+        <label for="title_include">include regex</label>
+        <input type="text" id="title_include" name="title_include"
+               value="{{ settings.title_include or '' }}"
+               placeholder="e.g. ^Episode\s+\d+">
+      </div>
+      <div class="row">
+        <label for="title_exclude">exclude regex</label>
+        <input type="text" id="title_exclude" name="title_exclude"
+               value="{{ settings.title_exclude or '' }}"
+               placeholder="e.g. \b(stream|live)\b">
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="submit">save</button>
+      <a class="secondary" href="/">back to board</a>
+    </div>
+  </form>
+</main>
+</body>
+</html>

@@ -1,0 +1,111 @@
+<div class="stats">
+  <span><strong>{{ totals.channels }}</strong> channels</span>
+  <span><strong>{{ totals.videos }}</strong> videos</span>
+  {% if totals.new %}<span class="hot"><strong>{{ totals.new }}</strong> new</span>{% endif %}
+  {% if totals.queued %}<span><strong>{{ totals.queued }}</strong> queued</span>{% endif %}
+  {% if totals.failed %}<span class="bad"><strong>{{ totals.failed }}</strong> failed</span>{% endif %}
+  <span class="muted"><strong>{{ totals.done }}</strong> done</span>
+  {% if totals.watched %}<span class="muted"><strong>{{ totals.watched }}</strong> watched</span>{% endif %}
+</div>
+{% if all_tags or active_tag %}
+  {% set base_qs = ('hidden=1' if show_hidden else '') %}
+  <div class="filter-bar">
+    <span class="filter-label">filter:</span>
+    {% if active_tag %}
+      <a class="tag-chip active"
+         href="?{{ base_qs }}"
+         hx-get="/board{% if base_qs %}?{{ base_qs }}{% endif %}"
+         hx-target="#board"
+         hx-swap="innerHTML"
+         hx-push-url="{% if base_qs %}?{{ base_qs }}{% else %}/{% endif %}">×&nbsp;{{ active_tag }}</a>
+    {% endif %}
+    {% for prefix, group in grouped_tags.items() %}
+      <div class="filter-group">
+        {% if prefix %}<span class="filter-group-label">{{ prefix }}</span>{% endif %}
+        {% for t in group %}
+          {% if t.name != active_tag %}
+            {% set chip_qs = 'tag=' ~ t.name ~ ('&hidden=1' if show_hidden else '') %}
+            <a class="tag-chip"
+               href="?{{ chip_qs }}"
+               hx-get="/board?{{ chip_qs }}"
+               hx-target="#board"
+               hx-swap="innerHTML"
+               hx-push-url="?{{ chip_qs }}">
+              {{ t.suffix if prefix else t.name }}
+              <span class="tag-count">{{ t.video_count + t.channel_count }}</span>
+            </a>
+          {% endif %}
+        {% endfor %}
+      </div>
+    {% endfor %}
+    <a class="filter-manage" href="/tags">tags…</a>
+    <a class="filter-manage" href="/presets">presets…</a>
+  </div>
+{% endif %}
+
+<div class="sections" data-base-preset="{{ base_preset }}">
+  {% for section in sections %}
+    <section class="section" data-profile="{{ section.profile }}">
+      <header class="section-header">
+        {% if section.profile %}
+          <h2 class="section-title">{{ section.profile }}</h2>
+        {% else %}
+          <h2 class="section-title muted">no profile</h2>
+        {% endif %}
+        <span class="section-count">{{ section.columns|length }} channel{{ '' if section.columns|length == 1 else 's' }}</span>
+      </header>
+      <div class="rows sortable-columns" data-profile="{{ section.profile }}">
+        {% for col in section.columns %}
+          {% set ch = col.channel %}
+          <article class="channel-row" data-channel="{{ ch.name }}" data-profile="{{ section.profile }}">
+            <header class="channel-head">
+              <div class="summary-row">
+                <span class="drag-handle" title="drag to move, or click to pick a profile" tabindex="0" role="button" aria-label="move {{ ch.name }} to a different profile">⋮⋮</span>
+                <a class="title" href="{{ ch.url }}" target="_blank" rel="noopener" title="{{ ch.name }}">{{ ch.display_name or ch.name }}</a>
+                <a class="row-settings" href="/channels/{{ ch.name }}/settings" title="channel settings" aria-label="settings for {{ ch.name }}">⚙</a>
+              </div>
+              <div class="counts">
+                {% if show_hidden %}
+                  {{ col.counts.get('hidden', 0) }} hidden
+                {% else %}
+                  {% if col.actionable %}
+                    <strong>{{ col.actionable }} new</strong>
+                  {% else %}<span class="muted">caught up</span>{% endif %}
+                  {% if col.counts.get('watched', 0) %} · <span class="muted">{{ col.counts.get('watched', 0) }} watched</span>{% endif %}
+                {% endif %}
+              </div>
+              {% with tags = channel_tags_map.get(ch.name, []), channel_name = ch.name %}
+                {% include "_tags_channel.html" %}
+              {% endwith %}
+              {% if ch.last_error %}
+                <div class="err" title="{{ ch.last_error }}">poll failed: {{ ch.last_error[:80] }}</div>
+              {% endif %}
+            </header>
+            <div class="videos">
+              {% for v in col.videos %}
+                {% include "_card.html" %}
+              {% else %}
+                <p class="videos-empty">No videos to show.</p>
+              {% endfor %}
+            </div>
+          </article>
+        {% else %}
+          <p class="empty-section">drop a channel here</p>
+        {% endfor %}
+      </div>
+    </section>
+  {% else %}
+    <p style="color: var(--muted)">
+      {% if active_tag %}
+        No channels match <strong>{{ active_tag }}</strong>.
+        <a href="?{% if show_hidden %}hidden=1{% endif %}"
+           hx-get="/board{% if show_hidden %}?hidden=1{% endif %}"
+           hx-target="#board"
+           hx-swap="innerHTML"
+           hx-push-url="{% if show_hidden %}?hidden=1{% else %}/{% endif %}">clear filter</a>.
+      {% else %}
+        No channels yet. Add one via <code>POST {{ '{' }} ytdl-sub-api {{ '}' }}/channels</code>.
+      {% endif %}
+    </p>
+  {% endfor %}
+</div>
