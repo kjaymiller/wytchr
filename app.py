@@ -810,7 +810,8 @@ def board_partial():
             if channel_has_tag:
                 videos = db.execute(
                     f"""SELECT v.video_id, v.title, v.duration, v.upload_date,
-                               v.thumbnail_url, v.url, v.status, v.favorited_at
+                               v.thumbnail_url, v.url, v.status, v.favorited_at,
+                               v.description
                           FROM videos v
                          WHERE v.channel_name = ?
                            AND v.status IN ({status_placeholders})
@@ -823,7 +824,8 @@ def board_partial():
             else:
                 videos = db.execute(
                     f"""SELECT v.video_id, v.title, v.duration, v.upload_date,
-                               v.thumbnail_url, v.url, v.status, v.favorited_at
+                               v.thumbnail_url, v.url, v.status, v.favorited_at,
+                               v.description
                           FROM videos v
                           JOIN video_tags vt ON vt.video_id = v.video_id
                          WHERE v.channel_name = ?

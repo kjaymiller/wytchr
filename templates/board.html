@@ -295,6 +295,12 @@
     .card .title { font-weight: 500; font-size: .9rem; line-height: 1.3; }
     .card .title a { color: var(--fg); text-decoration: none; }
     .card .title a:hover { color: var(--accent); }
+    .card .desc {
+      margin: 0; color: var(--muted); font-size: .75rem; line-height: 1.35;
+      display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3;
+      -webkit-box-orient: vertical; overflow: hidden;
+      white-space: pre-wrap; word-break: break-word;
+    }
     .card .meta { display: flex; justify-content: space-between; color: var(--muted); font-size: .75rem; }
     .card .actions { display: flex; gap: .3rem; margin-top: .25rem; align-items: center; }
     .card .actions .icon-btn {

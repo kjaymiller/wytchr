@@ -13,6 +13,9 @@
   <div class="title">
     <a href="{{ v.url }}" target="_blank" rel="noopener">{{ v.title or v.video_id }}</a>
   </div>
+  {% if v.description %}
+    <p class="desc" title="{{ v.description }}">{{ v.description }}</p>
+  {% endif %}
   <div class="meta">
     <span>
       {%- if v.upload_date and v.upload_date|length == 8 -%}
