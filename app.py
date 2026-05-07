@@ -1653,7 +1653,7 @@ def favorite_video(video_id: str):
         db.execute("UPDATE videos SET favorited_at = ? WHERE video_id = ?", (now, video_id))
         db.commit()
         favorited = True
-        _fire_webhooks_async("video.favorited", {"video": _video_payload(row)})
+        _fire_webhooks_async("video.favorited", _video_payload(row))
     if request.headers.get("HX-Request"):
         return _render_card(video_id)
     return jsonify({"ok": True, "favorited": favorited})
@@ -1737,12 +1737,13 @@ def webhooks_test(hook_id: int):
         return ("not found", 404)
     _fire_webhooks_async(
         row["event"],
-        {"video": {
+        {
             "id": "test", "title": "wytchr test event",
             "url": "https://wytchr.example/test",
             "channel": "wytchr", "thumbnail_url": None,
             "duration": 0, "upload_date": None,
-        }, "test": True},
+            "test": True,
+        },
         hook_id=hook_id,
     )
     return redirect("/webhooks")
