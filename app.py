@@ -555,10 +555,11 @@ def poll_channel(db: sqlite3.Connection, name: str, url: str) -> tuple[int, str 
             new_count += 1
         else:
             # Backfill description if this row predates the description
-            # column. Only fetch when missing — guards against re-fetching
-            # every poll cycle for the same video.
+            # column. Skip dismissed videos — the operator already moved
+            # on, no point spending a yt-dlp call on something that
+            # won't be favorited.
             backfill_desc = None
-            if not existing["description"]:
+            if not existing["description"] and existing["status"] not in ("watched", "hidden"):
                 backfill_desc = _fetch_description(watch_url)
             db.execute(
                 """UPDATE videos
