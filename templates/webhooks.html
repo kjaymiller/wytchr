@@ -67,8 +67,9 @@
     <p class="hint">
       Outbound webhooks fire when a wytchr event happens. Today the only event is
       <code>video.favorited</code> (sent when you tap ★ on a card). The POST body is
-      <code>{"event": "video.favorited", "timestamp": …, "id", "title", "url", "channel", "thumbnail_url", "duration", "upload_date"}</code>
-      (flat — fields live at the top level alongside <code>event</code>).
+      <code>{"event": "video.favorited", "timestamp": …, "id", "title", "url", "channel", "thumbnail_url", "duration", "upload_date", "description", "notes"}</code>
+      (flat — fields live at the top level alongside <code>event</code>; <code>notes</code> mirrors the YouTube
+      description, fetched lazily on first favorite).
       If a bearer token is set, it's sent as <code>Authorization: Bearer …</code>.
     </p>
 

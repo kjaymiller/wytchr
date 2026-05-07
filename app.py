@@ -160,6 +160,8 @@ def init_db():
         if "favorited_at" not in cols:
             db.execute("ALTER TABLE videos ADD COLUMN favorited_at INTEGER")
             db.execute("CREATE INDEX IF NOT EXISTS videos_favorited ON videos(favorited_at DESC)")
+        if "description" not in cols:
+            db.execute("ALTER TABLE videos ADD COLUMN description TEXT")
 
 
 # --- Tags -------------------------------------------------------------
@@ -526,7 +528,7 @@ def poll_channel(db: sqlite3.Connection, name: str, url: str) -> tuple[int, str 
         if _is_short(e):
             continue
         existing = db.execute(
-            "SELECT status FROM videos WHERE video_id = ?", (vid,)
+            "SELECT status, description FROM videos WHERE video_id = ?", (vid,)
         ).fetchone()
         title = e.get("title")
         duration = int(e["duration"]) if isinstance(e.get("duration"), (int, float)) else None
@@ -542,24 +544,32 @@ def poll_channel(db: sqlite3.Connection, name: str, url: str) -> tuple[int, str 
         thumb = _best_thumbnail(e)
         watch_url = e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
         if existing is None:
+            description = _fetch_description(watch_url)
             db.execute(
                 """INSERT INTO videos
                    (video_id, channel_name, title, duration, upload_date,
-                    thumbnail_url, url, status, seen_at, status_changed_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)""",
-                (vid, name, title, duration, upload_date, thumb, watch_url, now, now),
+                    thumbnail_url, url, status, seen_at, status_changed_at, description)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)""",
+                (vid, name, title, duration, upload_date, thumb, watch_url, now, now, description),
             )
             new_count += 1
         else:
+            # Backfill description if this row predates the description
+            # column. Only fetch when missing — guards against re-fetching
+            # every poll cycle for the same video.
+            backfill_desc = None
+            if not existing["description"]:
+                backfill_desc = _fetch_description(watch_url)
             db.execute(
                 """UPDATE videos
                       SET title = COALESCE(?, title),
                           duration = COALESCE(?, duration),
                           upload_date = COALESCE(?, upload_date),
                           thumbnail_url = COALESCE(?, thumbnail_url),
-                          url = COALESCE(?, url)
+                          url = COALESCE(?, url),
+                          description = COALESCE(?, description)
                     WHERE video_id = ?""",
-                (title, duration, upload_date, thumb, watch_url, vid),
+                (title, duration, upload_date, thumb, watch_url, backfill_desc, vid),
             )
     db.execute(
         "UPDATE channels SET last_polled_at = ?, last_error = NULL WHERE name = ?",
@@ -1571,7 +1581,7 @@ def unhide_video(video_id: str):
 def _render_card(video_id: str):
     db = get_db()
     row = db.execute(
-        """SELECT video_id, title, duration, upload_date, thumbnail_url, url, status, channel_name, favorited_at
+        """SELECT video_id, title, duration, upload_date, thumbnail_url, url, status, channel_name, favorited_at, description
              FROM videos WHERE video_id = ?""",
         (video_id,),
     ).fetchone()
@@ -1583,6 +1593,13 @@ def _render_card(video_id: str):
 # --- Favorites + webhooks --------------------------------------------
 
 def _video_payload(row: sqlite3.Row) -> dict:
+    # Receivers (e.g. all-my-favs) typically expect bookmark fields
+    # at the top level: url, title, notes. We map description→notes.
+    desc = None
+    try:
+        desc = row["description"]
+    except (IndexError, KeyError):
+        pass
     return {
         "id": row["video_id"],
         "title": row["title"],
@@ -1591,45 +1608,69 @@ def _video_payload(row: sqlite3.Row) -> dict:
         "thumbnail_url": row["thumbnail_url"],
         "duration": row["duration"],
         "upload_date": row["upload_date"],
+        "description": desc,
+        "notes": desc,
     }
 
 
-def _fire_webhooks_async(event: str, payload: dict, hook_id: int | None = None) -> None:
-    """Fire-and-forget POST to every enabled webhook for `event`, or
-    just one specific webhook if `hook_id` is given (used by /test).
-    Runs in a daemon thread so the request returns immediately."""
-    def run():
+def _fetch_description(video_url: str) -> str | None:
+    """One-shot yt-dlp call for a single video's description. Skips
+    full info-extraction (just `--print description`) to keep the
+    request quick and the bot-gate footprint small."""
+    try:
+        proc = subprocess.run(
+            ["yt-dlp", "--skip-download", "--no-playlist",
+             "--print", "description", video_url],
+            capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode != 0:
+            return None
+        text = proc.stdout.strip()
+        return text or None
+    except Exception:
+        return None
+
+
+def _fire_webhooks_sync(event: str, payload: dict, hook_id: int | None = None) -> None:
+    """POST to webhooks synchronously. Caller is responsible for
+    running this off the request thread when latency matters."""
+    with standalone_db() as db:
+        if hook_id is not None:
+            hooks = db.execute(
+                "SELECT id, url, bearer_token FROM webhooks WHERE id = ?",
+                (hook_id,),
+            ).fetchall()
+        else:
+            hooks = db.execute(
+                "SELECT id, url, bearer_token FROM webhooks WHERE event = ? AND enabled = 1",
+                (event,),
+            ).fetchall()
+    body = {"event": event, "timestamp": int(time.time()), **payload}
+    for h in hooks:
+        headers = {"Content-Type": "application/json", "User-Agent": "wytchr/1.0"}
+        if h["bearer_token"]:
+            headers["Authorization"] = f"Bearer {h['bearer_token']}"
+        status: int | None = None
+        err: str | None = None
+        try:
+            r = httpx.post(h["url"], json=body, headers=headers, timeout=10.0)
+            status = r.status_code
+            if r.status_code >= 400:
+                err = (r.text or "")[:500]
+        except Exception as e:
+            err = str(e)[:500]
         with standalone_db() as db:
-            if hook_id is not None:
-                hooks = db.execute(
-                    "SELECT id, url, bearer_token FROM webhooks WHERE id = ?",
-                    (hook_id,),
-                ).fetchall()
-            else:
-                hooks = db.execute(
-                    "SELECT id, url, bearer_token FROM webhooks WHERE event = ? AND enabled = 1",
-                    (event,),
-                ).fetchall()
-        body = {"event": event, "timestamp": int(time.time()), **payload}
-        for h in hooks:
-            headers = {"Content-Type": "application/json", "User-Agent": "wytchr/1.0"}
-            if h["bearer_token"]:
-                headers["Authorization"] = f"Bearer {h['bearer_token']}"
-            status: int | None = None
-            err: str | None = None
-            try:
-                r = httpx.post(h["url"], json=body, headers=headers, timeout=10.0)
-                status = r.status_code
-                if r.status_code >= 400:
-                    err = (r.text or "")[:500]
-            except Exception as e:
-                err = str(e)[:500]
-            with standalone_db() as db:
-                db.execute(
-                    "UPDATE webhooks SET last_fired_at = ?, last_status = ?, last_error = ? WHERE id = ?",
-                    (int(time.time()), status, err, h["id"]),
-                )
-    threading.Thread(target=run, daemon=True).start()
+            db.execute(
+                "UPDATE webhooks SET last_fired_at = ?, last_status = ?, last_error = ? WHERE id = ?",
+                (int(time.time()), status, err, h["id"]),
+            )
+
+
+def _fire_webhooks_async(event: str, payload: dict, hook_id: int | None = None) -> None:
+    """Fire-and-forget wrapper around _fire_webhooks_sync."""
+    threading.Thread(
+        target=_fire_webhooks_sync, args=(event, payload, hook_id), daemon=True,
+    ).start()
 
 
 @app.post("/videos/<video_id>/favorite")
@@ -1638,7 +1679,7 @@ def favorite_video(video_id: str):
     db = get_db()
     row = db.execute(
         """SELECT v.video_id, v.title, v.duration, v.upload_date, v.thumbnail_url,
-                  v.url, v.status, v.channel_name, v.favorited_at
+                  v.url, v.status, v.channel_name, v.favorited_at, v.description
              FROM videos v WHERE v.video_id = ?""",
         (video_id,),
     ).fetchone()
@@ -1742,6 +1783,8 @@ def webhooks_test(hook_id: int):
             "url": "https://wytchr.example/test",
             "channel": "wytchr", "thumbnail_url": None,
             "duration": 0, "upload_date": None,
+            "description": "test description from wytchr",
+            "notes": "test description from wytchr",
             "test": True,
         },
         hook_id=hook_id,
