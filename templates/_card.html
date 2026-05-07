@@ -15,6 +15,15 @@
   </div>
   {% if v.description %}
     <p class="desc" title="{{ v.description }}">{{ v.description }}</p>
+  {% else %}
+    <button class="desc-fetch"
+            hx-post="/videos/{{ v.video_id }}/fetch-description"
+            hx-target="#card-{{ v.video_id }}"
+            hx-swap="outerHTML"
+            hx-disabled-elt="this"
+            title="fetch description from YouTube Data API (1 quota unit)">
+      fetch description
+    </button>
   {% endif %}
   <div class="meta">
     <span>

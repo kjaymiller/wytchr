@@ -532,7 +532,7 @@ def poll_channel(db: sqlite3.Connection, name: str, url: str) -> tuple[int, str 
         if _is_short(e):
             continue
         existing = db.execute(
-            "SELECT status, description FROM videos WHERE video_id = ?", (vid,)
+            "SELECT status FROM videos WHERE video_id = ?", (vid,)
         ).fetchone()
         title = e.get("title")
         duration = int(e["duration"]) if isinstance(e.get("duration"), (int, float)) else None
@@ -548,33 +548,24 @@ def poll_channel(db: sqlite3.Connection, name: str, url: str) -> tuple[int, str 
         thumb = _best_thumbnail(e)
         watch_url = e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
         if existing is None:
-            description = _fetch_description(watch_url)
             db.execute(
                 """INSERT INTO videos
                    (video_id, channel_name, title, duration, upload_date,
-                    thumbnail_url, url, status, seen_at, status_changed_at, description)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)""",
-                (vid, name, title, duration, upload_date, thumb, watch_url, now, now, description),
+                    thumbnail_url, url, status, seen_at, status_changed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)""",
+                (vid, name, title, duration, upload_date, thumb, watch_url, now, now),
             )
             new_count += 1
         else:
-            # Backfill description if this row predates the description
-            # column. Skip dismissed videos — the operator already moved
-            # on, no point spending a yt-dlp call on something that
-            # won't be favorited.
-            backfill_desc = None
-            if not existing["description"] and existing["status"] not in ("watched", "hidden"):
-                backfill_desc = _fetch_description(watch_url)
             db.execute(
                 """UPDATE videos
                       SET title = COALESCE(?, title),
                           duration = COALESCE(?, duration),
                           upload_date = COALESCE(?, upload_date),
                           thumbnail_url = COALESCE(?, thumbnail_url),
-                          url = COALESCE(?, url),
-                          description = COALESCE(?, description)
+                          url = COALESCE(?, url)
                     WHERE video_id = ?""",
-                (title, duration, upload_date, thumb, watch_url, backfill_desc, vid),
+                (title, duration, upload_date, thumb, watch_url, vid),
             )
     db.execute(
         "UPDATE channels SET last_polled_at = ?, last_error = NULL WHERE name = ?",
@@ -1623,6 +1614,37 @@ def _video_payload(row: sqlite3.Row) -> dict:
 _VIDEO_ID_RE = re.compile(r"(?:v=|/shorts/|youtu\.be/)([A-Za-z0-9_-]{11})")
 
 
+def _enrich_and_fire_async(video_id: str) -> None:
+    """Bg: backfill description (if missing), then fire the favorite
+    webhook. Caller has already toggled favorited_at on."""
+    def run():
+        with standalone_db() as db:
+            row = db.execute(
+                """SELECT video_id, title, duration, upload_date, thumbnail_url,
+                          url, status, channel_name, favorited_at, description
+                     FROM videos WHERE video_id = ?""",
+                (video_id,),
+            ).fetchone()
+            if not row:
+                return
+            if not row["description"] and row["url"]:
+                desc = _fetch_description(row["url"])
+                if desc:
+                    db.execute(
+                        "UPDATE videos SET description = ? WHERE video_id = ?",
+                        (desc, video_id),
+                    )
+                    db.commit()
+                    row = db.execute(
+                        """SELECT video_id, title, duration, upload_date, thumbnail_url,
+                                  url, status, channel_name, favorited_at, description
+                             FROM videos WHERE video_id = ?""",
+                        (video_id,),
+                    ).fetchone()
+        _fire_webhooks_sync("video.favorited", _video_payload(row))
+    threading.Thread(target=run, daemon=True).start()
+
+
 def _fetch_description(video_url: str) -> str | None:
     """Pull a video's description via the YouTube Data API v3. Returns
     None if no API key is set, the URL doesn't carry an 11-char id, or
@@ -1716,10 +1738,37 @@ def favorite_video(video_id: str):
         db.execute("UPDATE videos SET favorited_at = ? WHERE video_id = ?", (now, video_id))
         db.commit()
         favorited = True
-        _fire_webhooks_async("video.favorited", _video_payload(row))
+        # Backfill description (1 YouTube Data API unit) and fire the
+        # webhook in the same background thread so the UI returns
+        # immediately. Description has to land before the POST or the
+        # receiver gets notes=null.
+        _enrich_and_fire_async(video_id)
     if request.headers.get("HX-Request"):
         return _render_card(video_id)
     return jsonify({"ok": True, "favorited": favorited})
+
+
+@app.post("/videos/<video_id>/fetch-description")
+@auth_required
+def fetch_video_description(video_id: str):
+    """On-demand description fetch. Synchronous so the operator gets
+    the updated card back in the same response."""
+    db = get_db()
+    row = db.execute(
+        "SELECT video_id, url FROM videos WHERE video_id = ?", (video_id,)
+    ).fetchone()
+    if not row:
+        return jsonify({"error": "video not found"}), 404
+    desc = _fetch_description(row["url"]) if row["url"] else None
+    if desc:
+        db.execute(
+            "UPDATE videos SET description = ? WHERE video_id = ?",
+            (desc, video_id),
+        )
+        db.commit()
+    if request.headers.get("HX-Request"):
+        return _render_card(video_id)
+    return jsonify({"ok": bool(desc), "description": desc})
 
 
 @app.get("/favorites")

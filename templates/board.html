@@ -295,6 +295,14 @@
     .card .title { font-weight: 500; font-size: .9rem; line-height: 1.3; }
     .card .title a { color: var(--fg); text-decoration: none; }
     .card .title a:hover { color: var(--accent); }
+    .card .desc-fetch {
+      align-self: flex-start;
+      background: transparent; color: var(--muted);
+      border: 1px dashed var(--line); border-radius: 4px;
+      font: inherit; font-size: .7rem; padding: .15rem .45rem;
+      cursor: pointer; transition: color .12s, border-color .12s;
+    }
+    .card .desc-fetch:hover { color: var(--accent); border-color: var(--accent); }
     .card .desc {
       margin: 0; color: var(--muted); font-size: .75rem; line-height: 1.35;
       display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3;
