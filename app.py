@@ -25,6 +25,10 @@ from flask import Flask, g, jsonify, redirect, render_template, request
 API_TOKEN = os.environ.get("API_TOKEN", "")
 YTDL_SUB_API_URL = os.environ.get("YTDL_SUB_API_URL", "http://ytdl-sub-api:5000").rstrip("/")
 YTDL_SUB_API_TOKEN = os.environ.get("YTDL_SUB_API_TOKEN", API_TOKEN)
+# YouTube Data API v3 key for fetching video descriptions. Optional —
+# when unset, description-related fields stay NULL but everything else
+# works. The flat-playlist polling path doesn't depend on it.
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 DB_PATH = Path(os.environ.get("DB_PATH", "/data/wytchr.db"))
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "30"))
 POLL_LIMIT = int(os.environ.get("POLL_LIMIT", "30"))
@@ -1616,20 +1620,35 @@ def _video_payload(row: sqlite3.Row) -> dict:
     }
 
 
+_VIDEO_ID_RE = re.compile(r"(?:v=|/shorts/|youtu\.be/)([A-Za-z0-9_-]{11})")
+
+
 def _fetch_description(video_url: str) -> str | None:
-    """One-shot yt-dlp call for a single video's description. Skips
-    full info-extraction (just `--print description`) to keep the
-    request quick and the bot-gate footprint small."""
+    """Pull a video's description via the YouTube Data API v3. Returns
+    None if no API key is set, the URL doesn't carry an 11-char id, or
+    the call fails — caller treats None as "skip" and stores NULL.
+
+    yt-dlp can't do this from the K6 IP without auth (bot-gate), and
+    the operator has rejected cookies. The Data API has a 10k-unit
+    daily free quota; videos.list?part=snippet is 1 unit per call."""
+    if not YOUTUBE_API_KEY:
+        return None
+    m = _VIDEO_ID_RE.search(video_url)
+    if not m:
+        return None
     try:
-        proc = subprocess.run(
-            ["yt-dlp", "--skip-download", "--no-playlist",
-             "--print", "description", video_url],
-            capture_output=True, text=True, timeout=30,
+        r = httpx.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={"id": m.group(1), "part": "snippet", "key": YOUTUBE_API_KEY},
+            timeout=10.0,
         )
-        if proc.returncode != 0:
+        if r.status_code != 200:
             return None
-        text = proc.stdout.strip()
-        return text or None
+        items = r.json().get("items") or []
+        if not items:
+            return None
+        desc = (items[0].get("snippet") or {}).get("description")
+        return desc.strip() if desc else None
     except Exception:
         return None
 
