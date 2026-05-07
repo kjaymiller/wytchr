@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>wytchr · favorites</title>
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <style>
+    :root { color-scheme: dark; }
+    body, body[data-theme="licorice"] { --bg:#0a060d; --bg-deep:#050309; --card:#15101a; --card-soft:#1d1626; --line:#2d2238; --fg:#f3e9e6; --muted:#8a7d8a; --accent:#ff5f87; --accent-ink:#1a0a14; --accent-soft: rgba(255,95,135,.13); --danger:#f25b5b; --danger-soft: rgba(242,91,91,.1); --ok:#b8e0a3; --ok-soft: rgba(184,224,163,.13); --secondary:#c9a9f0; --secondary-soft: rgba(201,169,240,.13); }
+    body[data-theme="marmite"] { --bg:#14100a; --bg-deep:#0a0805; --card:#221a10; --card-soft:#2e2316; --line:#3d2f1d; --fg:#f7e7a8; --muted:#a89568; --accent:#f5c518; --accent-ink:#1a1208; --accent-soft: rgba(245,197,24,.14); --danger:#d63d3d; --danger-soft: rgba(214,61,61,.12); --ok:#9bc053; --ok-soft: rgba(155,192,83,.13); --secondary:#c8341c; --secondary-soft: rgba(200,52,28,.16); }
+    body[data-theme="sees"] { --bg:#14100c; --bg-deep:#08060a; --card:#221a14; --card-soft:#2e2218; --line:#3d2e22; --fg:#f5ebe0; --muted:#a89578; --accent:#d4a574; --accent-ink:#14100c; --accent-soft: rgba(212,165,116,.14); --danger:#c84545; --danger-soft: rgba(200,69,69,.12); --ok:#9aae6a; --ok-soft: rgba(154,174,106,.13); --secondary:#b8443e; --secondary-soft: rgba(184,68,62,.14); }
+    body[data-theme="jaffa"] { --bg:#1c0e04; --bg-deep:#0e0702; --card:#2c1808; --card-soft:#3a2010; --line:#4c3018; --fg:#f5d8a8; --muted:#a8835a; --accent:#f97316; --accent-ink:#1c0e04; --accent-soft: rgba(249,115,22,.13); --danger:#d63d3d; --danger-soft: rgba(214,61,61,.12); --ok:#a8be58; --ok-soft: rgba(168,190,88,.13); --secondary:#dfa14a; --secondary-soft: rgba(223,161,74,.13); }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; }
+    header { display: flex; align-items: center; gap: 1.25rem; padding: .75rem 1rem; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; padding-right: .75rem; border-right: 1px solid var(--line); }
+    header a { color: var(--muted); text-decoration: none; font-size: .85rem; }
+    header a:hover { color: var(--accent); }
+    main { max-width: 80rem; padding: 1rem; margin: 0 auto; }
+    .empty { color: var(--muted); padding: 2rem; text-align: center; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: .75rem;
+    }
+    .card { position: relative; display: flex; flex-direction: column; gap: .35rem; padding: .5rem; border: 1px solid var(--line); border-radius: 6px; background: var(--card-soft); }
+    .card[data-favorited="1"] { border-color: var(--accent); }
+    .card .thumb { width: 100%; aspect-ratio: 16/9; background: var(--bg-deep); border-radius: 4px; object-fit: cover; }
+    .card .title { font-weight: 500; font-size: .9rem; line-height: 1.3; }
+    .card .title a { color: var(--fg); text-decoration: none; }
+    .card .title a:hover { color: var(--accent); }
+    .card .meta { display: flex; justify-content: space-between; color: var(--muted); font-size: .75rem; gap: .35rem; }
+    .card .channel { color: var(--muted); font-size: .75rem; font-family: ui-monospace, monospace; }
+    .badge { display: inline-block; padding: .05rem .4rem; border-radius: 3px; font-size: .7rem; text-transform: uppercase; letter-spacing: .04em; }
+    .badge.new { background: var(--accent-soft); color: var(--accent); }
+    .badge.queued, .badge.downloading { background: var(--secondary-soft); color: var(--secondary); }
+    .badge.done { background: var(--ok-soft); color: var(--ok); }
+    .badge.failed { background: var(--danger-soft); color: var(--danger); }
+    .badge.watched, .badge.hidden { background: var(--card); color: var(--muted); border: 1px solid var(--line); }
+    .fav-btn {
+      position: absolute; top: .35rem; right: .35rem;
+      background: rgba(0,0,0,.45); color: var(--accent);
+      border: none; border-radius: 50%; width: 1.7rem; height: 1.7rem;
+      font-size: 1rem; line-height: 1; cursor: pointer; padding: 0;
+      transition: color .12s, background .12s, transform .1s;
+      z-index: 2;
+    }
+    .fav-btn:hover { transform: scale(1.1); }
+  </style>
+</head>
+<body data-theme="licorice">
+  <script>try { const t = localStorage.getItem('wytchr.theme'); if (t) document.body.setAttribute('data-theme', t); } catch (e) {}</script>
+  <header>
+    <h1>wytchr · favorites</h1>
+    <a href="/">← back to board</a>
+    <a href="/webhooks">webhooks</a>
+  </header>
+  <main>
+    {% if not videos %}
+      <p class="empty">no favorites yet — tap ☆ on a card to favorite it.</p>
+    {% else %}
+      <div class="grid">
+        {% for v in videos %}
+          <article class="card" data-status="{{ v.status }}" data-favorited="1" id="card-{{ v.video_id }}">
+            <button class="fav-btn"
+                    hx-post="/videos/{{ v.video_id }}/favorite"
+                    hx-target="#card-{{ v.video_id }}"
+                    hx-swap="delete"
+                    aria-pressed="true"
+                    title="unfavorite">★</button>
+            {% if v.thumbnail_url %}
+              <a href="{{ v.url }}" target="_blank" rel="noopener">
+                <img class="thumb" src="{{ v.thumbnail_url }}" alt="" loading="lazy">
+              </a>
+            {% endif %}
+            <div class="title">
+              <a href="{{ v.url }}" target="_blank" rel="noopener">{{ v.title or v.video_id }}</a>
+            </div>
+            <div class="channel">{{ v.channel_name }}</div>
+            <div class="meta">
+              <span>
+                {%- if v.upload_date and v.upload_date|length == 8 -%}
+                  {{ v.upload_date[:4] }}-{{ v.upload_date[4:6] }}-{{ v.upload_date[6:8] }}
+                {%- elif v.upload_date -%}{{ v.upload_date }}{%- else -%}—{%- endif -%}
+              </span>
+              <span>
+                {%- if v.duration -%}
+                  {%- set m = (v.duration // 60) -%}{%- set s = (v.duration % 60) -%}
+                  {{ m }}:{{ '%02d' % s }}
+                {%- endif -%}
+              </span>
+              <span class="badge {{ v.status }}">{{ v.status }}</span>
+            </div>
+          </article>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </main>
+</body>
+</html>

@@ -276,7 +276,19 @@
       flex: 0 0 220px; width: 220px;
       scroll-snap-align: start;
     }
+    .card { position: relative; }
     .card[data-status="done"] { opacity: .55; }
+    .card[data-favorited="1"] { border-color: var(--accent); }
+    .fav-btn {
+      position: absolute; top: .35rem; right: .35rem;
+      background: rgba(0,0,0,.45); color: var(--muted);
+      border: none; border-radius: 50%; width: 1.7rem; height: 1.7rem;
+      font-size: 1rem; line-height: 1; cursor: pointer; padding: 0;
+      transition: color .12s, background .12s, transform .1s;
+      z-index: 2;
+    }
+    .fav-btn:hover { color: var(--accent); transform: scale(1.1); }
+    .card[data-favorited="1"] .fav-btn { color: var(--accent); }
     .card[data-status="failed"] { border-color: var(--danger); }
     .card[data-status="queued"], .card[data-status="downloading"] { border-color: var(--accent); }
     .card .thumb { width: 100%; aspect-ratio: 16/9; background: var(--bg-deep); border-radius: 4px; object-fit: cover; }
@@ -398,6 +410,8 @@
           <option value="marmite">marmite</option>
         </optgroup>
       </select>
+      <a class="toggle" href="/favorites">favorites</a>
+      <a class="toggle" href="/webhooks">webhooks</a>
       <a class="toggle" href="?hidden=1" id="hidden-toggle">show hidden</a>
       <div class="settings-wrap">
         <button id="settings-btn" type="button" class="settings-btn"

@@ -12,6 +12,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from functools import wraps
@@ -63,6 +64,22 @@ CREATE TABLE IF NOT EXISTS videos (
 );
 CREATE INDEX IF NOT EXISTS videos_channel_status ON videos(channel_name, status);
 CREATE INDEX IF NOT EXISTS videos_seen ON videos(seen_at DESC);
+
+-- Outbound webhooks. Fired on `video.favorited` (toggle on); designed
+-- to feed downstream services like all-my-favs.
+CREATE TABLE IF NOT EXISTS webhooks (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  url TEXT NOT NULL,
+  event TEXT NOT NULL DEFAULT 'video.favorited',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  bearer_token TEXT,
+  created_at INTEGER NOT NULL,
+  last_fired_at INTEGER,
+  last_status INTEGER,
+  last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS webhooks_event_enabled ON webhooks(event, enabled);
 
 CREATE TABLE IF NOT EXISTS tags (
   id INTEGER PRIMARY KEY,
@@ -137,6 +154,12 @@ def standalone_db():
 def init_db():
     with standalone_db() as db:
         db.executescript(SCHEMA)
+        # ALTER-ADD-COLUMN migrations for older DBs. SQLite can't do
+        # ADD COLUMN IF NOT EXISTS, so we introspect first.
+        cols = {r[1] for r in db.execute("PRAGMA table_info(videos)")}
+        if "favorited_at" not in cols:
+            db.execute("ALTER TABLE videos ADD COLUMN favorited_at INTEGER")
+            db.execute("CREATE INDEX IF NOT EXISTS videos_favorited ON videos(favorited_at DESC)")
 
 
 # --- Tags -------------------------------------------------------------
@@ -776,7 +799,7 @@ def board_partial():
             if channel_has_tag:
                 videos = db.execute(
                     f"""SELECT v.video_id, v.title, v.duration, v.upload_date,
-                               v.thumbnail_url, v.url, v.status
+                               v.thumbnail_url, v.url, v.status, v.favorited_at
                           FROM videos v
                          WHERE v.channel_name = ?
                            AND v.status IN ({status_placeholders})
@@ -789,7 +812,7 @@ def board_partial():
             else:
                 videos = db.execute(
                     f"""SELECT v.video_id, v.title, v.duration, v.upload_date,
-                               v.thumbnail_url, v.url, v.status
+                               v.thumbnail_url, v.url, v.status, v.favorited_at
                           FROM videos v
                           JOIN video_tags vt ON vt.video_id = v.video_id
                          WHERE v.channel_name = ?
@@ -1548,13 +1571,181 @@ def unhide_video(video_id: str):
 def _render_card(video_id: str):
     db = get_db()
     row = db.execute(
-        """SELECT video_id, title, duration, upload_date, thumbnail_url, url, status, channel_name
+        """SELECT video_id, title, duration, upload_date, thumbnail_url, url, status, channel_name, favorited_at
              FROM videos WHERE video_id = ?""",
         (video_id,),
     ).fetchone()
     if not row:
         return ("", 404)
     return render_template("_card.html", v=row)
+
+
+# --- Favorites + webhooks --------------------------------------------
+
+def _video_payload(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["video_id"],
+        "title": row["title"],
+        "url": row["url"],
+        "channel": row["channel_name"],
+        "thumbnail_url": row["thumbnail_url"],
+        "duration": row["duration"],
+        "upload_date": row["upload_date"],
+    }
+
+
+def _fire_webhooks_async(event: str, payload: dict, hook_id: int | None = None) -> None:
+    """Fire-and-forget POST to every enabled webhook for `event`, or
+    just one specific webhook if `hook_id` is given (used by /test).
+    Runs in a daemon thread so the request returns immediately."""
+    def run():
+        with standalone_db() as db:
+            if hook_id is not None:
+                hooks = db.execute(
+                    "SELECT id, url, bearer_token FROM webhooks WHERE id = ?",
+                    (hook_id,),
+                ).fetchall()
+            else:
+                hooks = db.execute(
+                    "SELECT id, url, bearer_token FROM webhooks WHERE event = ? AND enabled = 1",
+                    (event,),
+                ).fetchall()
+        body = {"event": event, "timestamp": int(time.time()), **payload}
+        for h in hooks:
+            headers = {"Content-Type": "application/json", "User-Agent": "wytchr/1.0"}
+            if h["bearer_token"]:
+                headers["Authorization"] = f"Bearer {h['bearer_token']}"
+            status: int | None = None
+            err: str | None = None
+            try:
+                r = httpx.post(h["url"], json=body, headers=headers, timeout=10.0)
+                status = r.status_code
+                if r.status_code >= 400:
+                    err = (r.text or "")[:500]
+            except Exception as e:
+                err = str(e)[:500]
+            with standalone_db() as db:
+                db.execute(
+                    "UPDATE webhooks SET last_fired_at = ?, last_status = ?, last_error = ? WHERE id = ?",
+                    (int(time.time()), status, err, h["id"]),
+                )
+    threading.Thread(target=run, daemon=True).start()
+
+
+@app.post("/videos/<video_id>/favorite")
+@auth_required
+def favorite_video(video_id: str):
+    db = get_db()
+    row = db.execute(
+        """SELECT v.video_id, v.title, v.duration, v.upload_date, v.thumbnail_url,
+                  v.url, v.status, v.channel_name, v.favorited_at
+             FROM videos v WHERE v.video_id = ?""",
+        (video_id,),
+    ).fetchone()
+    if not row:
+        return jsonify({"error": "video not found"}), 404
+    now = int(time.time())
+    if row["favorited_at"]:
+        db.execute("UPDATE videos SET favorited_at = NULL WHERE video_id = ?", (video_id,))
+        db.commit()
+        favorited = False
+    else:
+        db.execute("UPDATE videos SET favorited_at = ? WHERE video_id = ?", (now, video_id))
+        db.commit()
+        favorited = True
+        _fire_webhooks_async("video.favorited", {"video": _video_payload(row)})
+    if request.headers.get("HX-Request"):
+        return _render_card(video_id)
+    return jsonify({"ok": True, "favorited": favorited})
+
+
+@app.get("/favorites")
+@auth_required
+def favorites_page():
+    db = get_db()
+    videos = db.execute(
+        """SELECT video_id, title, duration, upload_date, thumbnail_url, url,
+                  status, channel_name, favorited_at
+             FROM videos
+            WHERE favorited_at IS NOT NULL
+         ORDER BY favorited_at DESC""",
+    ).fetchall()
+    video_tags_map = _video_tags_map(db, [v["video_id"] for v in videos])
+    return render_template(
+        "favorites.html",
+        videos=videos,
+        video_tags_map=video_tags_map,
+    )
+
+
+@app.get("/webhooks")
+@auth_required
+def webhooks_admin():
+    db = get_db()
+    hooks = db.execute(
+        "SELECT id, name, url, event, enabled, bearer_token, created_at, last_fired_at, last_status, last_error FROM webhooks ORDER BY id"
+    ).fetchall()
+    return render_template("webhooks.html", hooks=hooks)
+
+
+@app.post("/webhooks")
+@auth_required
+def webhooks_create():
+    name = (request.form.get("name") or "").strip()
+    url = (request.form.get("url") or "").strip()
+    event = (request.form.get("event") or "video.favorited").strip()
+    bearer = (request.form.get("bearer_token") or "").strip() or None
+    if not name or not url:
+        return ("name and url are required", 400)
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return ("url must be http(s)", 400)
+    db = get_db()
+    db.execute(
+        "INSERT INTO webhooks (name, url, event, bearer_token, created_at) VALUES (?, ?, ?, ?, ?)",
+        (name, url, event, bearer, int(time.time())),
+    )
+    db.commit()
+    return redirect("/webhooks")
+
+
+@app.post("/webhooks/<int:hook_id>/toggle")
+@auth_required
+def webhooks_toggle(hook_id: int):
+    db = get_db()
+    db.execute("UPDATE webhooks SET enabled = 1 - enabled WHERE id = ?", (hook_id,))
+    db.commit()
+    return redirect("/webhooks")
+
+
+@app.post("/webhooks/<int:hook_id>/delete")
+@auth_required
+def webhooks_delete(hook_id: int):
+    db = get_db()
+    db.execute("DELETE FROM webhooks WHERE id = ?", (hook_id,))
+    db.commit()
+    return redirect("/webhooks")
+
+
+@app.post("/webhooks/<int:hook_id>/test")
+@auth_required
+def webhooks_test(hook_id: int):
+    db = get_db()
+    row = db.execute(
+        "SELECT event FROM webhooks WHERE id = ?", (hook_id,)
+    ).fetchone()
+    if not row:
+        return ("not found", 404)
+    _fire_webhooks_async(
+        row["event"],
+        {"video": {
+            "id": "test", "title": "wytchr test event",
+            "url": "https://wytchr.example/test",
+            "channel": "wytchr", "thumbnail_url": None,
+            "duration": 0, "upload_date": None,
+        }, "test": True},
+        hook_id=hook_id,
+    )
+    return redirect("/webhooks")
 
 
 # --- Bootstrap --------------------------------------------------------

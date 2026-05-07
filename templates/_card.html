@@ -1,4 +1,10 @@
-<article class="card" data-status="{{ v.status }}" id="card-{{ v.video_id }}">
+<article class="card" data-status="{{ v.status }}" data-favorited="{{ '1' if v.favorited_at else '0' }}" id="card-{{ v.video_id }}">
+  <button class="fav-btn"
+          hx-post="/videos/{{ v.video_id }}/favorite"
+          hx-target="#card-{{ v.video_id }}"
+          hx-swap="outerHTML"
+          aria-pressed="{{ 'true' if v.favorited_at else 'false' }}"
+          title="{{ 'unfavorite' if v.favorited_at else 'favorite' }}">{{ '★' if v.favorited_at else '☆' }}</button>
   {% if v.thumbnail_url %}
     <a href="{{ v.url }}" target="_blank" rel="noopener">
       <img class="thumb" src="{{ v.thumbnail_url }}" alt="" loading="lazy">

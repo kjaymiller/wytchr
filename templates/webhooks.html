@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>wytchr · webhooks</title>
+  <style>
+    :root { color-scheme: dark; }
+    body, body[data-theme="licorice"] { --bg:#0a060d; --card:#15101a; --line:#2d2238; --fg:#f3e9e6; --muted:#8a7d8a; --accent:#ff5f87; --accent-ink:#1a0a14; --danger:#f25b5b; --ok:#b8e0a3; }
+    body[data-theme="marmite"] { --bg:#14100a; --card:#221a10; --line:#3d2f1d; --fg:#f7e7a8; --muted:#a89568; --accent:#f5c518; --accent-ink:#1a1208; --danger:#d63d3d; --ok:#9bc053; }
+    body[data-theme="sees"] { --bg:#14100c; --card:#221a14; --line:#3d2e22; --fg:#f5ebe0; --muted:#a89578; --accent:#d4a574; --accent-ink:#14100c; --danger:#c84545; --ok:#9aae6a; }
+    body[data-theme="jaffa"] { --bg:#1c0e04; --card:#2c1808; --line:#4c3018; --fg:#f5d8a8; --muted:#a8835a; --accent:#f97316; --accent-ink:#1c0e04; --danger:#d63d3d; --ok:#a8be58; }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; }
+    header { display: flex; align-items: center; gap: 1.25rem; padding: .75rem 1rem; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; padding-right: .75rem; border-right: 1px solid var(--line); }
+    header a { color: var(--muted); text-decoration: none; font-size: .85rem; }
+    header a:hover { color: var(--accent); }
+    main { max-width: 60rem; padding: 1rem; margin: 0 auto; }
+    .hint { color: var(--muted); font-size: .8rem; margin: 0 0 1rem; }
+    .hook { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: .75rem; margin-bottom: .75rem; }
+    .hook[data-enabled="0"] { opacity: .55; }
+    .hook .row1 { display: flex; align-items: baseline; gap: .75rem; flex-wrap: wrap; }
+    .hook .name { font-weight: 600; }
+    .hook .url { color: var(--muted); font-family: ui-monospace, monospace; font-size: .8rem; word-break: break-all; }
+    .hook .event { font-family: ui-monospace, monospace; font-size: .75rem; color: var(--accent); }
+    .hook .last { color: var(--muted); font-size: .75rem; margin-top: .35rem; }
+    .hook .last.err { color: var(--danger); }
+    .hook .last.ok { color: var(--ok); }
+    .hook .actions { display: flex; gap: .35rem; margin-top: .5rem; }
+    .hook .actions form { display: inline; }
+    .hook .actions button {
+      background: transparent; border: 1px solid var(--line); color: var(--fg);
+      border-radius: 4px; padding: .25rem .65rem; font: inherit; font-size: .8rem; cursor: pointer;
+    }
+    .hook .actions button:hover { border-color: var(--accent); }
+    .hook .actions button.danger { color: var(--danger); }
+    .hook .actions button.danger:hover { background: var(--danger); color: var(--bg); border-color: var(--danger); }
+
+    .create { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: .85rem; margin-top: 1rem; }
+    .create h2 { margin: 0 0 .5rem; font-size: .95rem; }
+    .create form { display: grid; grid-template-columns: minmax(8rem, auto) 1fr; gap: .5rem .75rem; align-items: center; }
+    .create label { color: var(--muted); font-size: .8rem; }
+    .create input, .create select {
+      background: var(--bg); color: var(--fg);
+      border: 1px solid var(--line); border-radius: 4px;
+      padding: .35rem .55rem; font: inherit; font-size: .85rem; width: 100%;
+    }
+    .create input:focus, .create select:focus { outline: none; border-color: var(--accent); }
+    .create .submit { grid-column: 1 / -1; display: flex; justify-content: flex-end; }
+    .create button.primary {
+      background: var(--accent); color: var(--accent-ink); border: 1px solid var(--accent);
+      border-radius: 4px; padding: .35rem .9rem; font: inherit; font-weight: 600; cursor: pointer;
+    }
+    .empty { color: var(--muted); padding: 1rem 0; }
+  </style>
+</head>
+<body data-theme="licorice">
+  <script>try { const t = localStorage.getItem('wytchr.theme'); if (t) document.body.setAttribute('data-theme', t); } catch (e) {}</script>
+  <header>
+    <h1>wytchr · webhooks</h1>
+    <a href="/">← back to board</a>
+    <a href="/favorites">favorites</a>
+  </header>
+  <main>
+    <p class="hint">
+      Outbound webhooks fire when a wytchr event happens. Today the only event is
+      <code>video.favorited</code> (sent when you tap ★ on a card). The POST body is
+      <code>{"event": "video.favorited", "timestamp": …, "video": {id, title, url, channel, thumbnail_url, duration, upload_date}}</code>.
+      If a bearer token is set, it's sent as <code>Authorization: Bearer …</code>.
+    </p>
+
+    {% if not hooks %}
+      <p class="empty">no webhooks configured.</p>
+    {% else %}
+      {% for h in hooks %}
+        <div class="hook" data-enabled="{{ h.enabled }}">
+          <div class="row1">
+            <span class="name">{{ h.name }}</span>
+            <span class="event">{{ h.event }}</span>
+            {% if not h.enabled %}<span class="muted">(disabled)</span>{% endif %}
+          </div>
+          <div class="url">{{ h.url }}</div>
+          {% if h.last_fired_at %}
+            <div class="last {{ 'ok' if (h.last_status and h.last_status < 400 and not h.last_error) else 'err' if h.last_error else '' }}">
+              last fired: {{ h.last_fired_at|int }} ·
+              status {{ h.last_status or '—' }}{% if h.last_error %} · {{ h.last_error }}{% endif %}
+            </div>
+          {% else %}
+            <div class="last">never fired</div>
+          {% endif %}
+          <div class="actions">
+            <form method="post" action="/webhooks/{{ h.id }}/test">
+              <button type="submit">test</button>
+            </form>
+            <form method="post" action="/webhooks/{{ h.id }}/toggle">
+              <button type="submit">{{ 'disable' if h.enabled else 'enable' }}</button>
+            </form>
+            <form method="post" action="/webhooks/{{ h.id }}/delete"
+                  onsubmit="return confirm('Delete webhook {{ h.name }}?');">
+              <button type="submit" class="danger">delete</button>
+            </form>
+          </div>
+        </div>
+      {% endfor %}
+    {% endif %}
+
+    <section class="create">
+      <h2>add webhook</h2>
+      <form method="post" action="/webhooks">
+        <label for="hook-name">name</label>
+        <input id="hook-name" name="name" required placeholder="all-my-favs">
+        <label for="hook-url">url</label>
+        <input id="hook-url" name="url" type="url" required placeholder="https://all-my-favs.example/wytchr">
+        <label for="hook-event">event</label>
+        <select id="hook-event" name="event">
+          <option value="video.favorited">video.favorited</option>
+        </select>
+        <label for="hook-token">bearer token (optional)</label>
+        <input id="hook-token" name="bearer_token" placeholder="leave blank if downstream is unauthenticated">
+        <div class="submit">
+          <button type="submit" class="primary">create</button>
+        </div>
+      </form>
+    </section>
+  </main>
+</body>
+</html>
