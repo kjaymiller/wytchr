@@ -1744,7 +1744,24 @@ def favorite_video(video_id: str):
         # receiver gets notes=null.
         _enrich_and_fire_async(video_id)
     if request.headers.get("HX-Request"):
-        return _render_card(video_id)
+        resp = _render_card(video_id)
+        if isinstance(resp, str):
+            from flask import make_response
+            resp = make_response(resp)
+        title = (row["title"] or row["video_id"])[:80]
+        webhook_count = 0
+        if favorited:
+            webhook_count = db.execute(
+                "SELECT COUNT(*) AS n FROM webhooks WHERE event = 'video.favorited' AND enabled = 1"
+            ).fetchone()["n"]
+        resp.headers["HX-Trigger"] = json.dumps({
+            "wytchr:favorited": {
+                "favorited": favorited,
+                "title": title,
+                "webhook_count": webhook_count,
+            }
+        })
+        return resp
     return jsonify({"ok": True, "favorited": favorited})
 
 

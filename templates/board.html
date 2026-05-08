@@ -289,6 +289,13 @@
     }
     .fav-btn:hover { color: var(--accent); transform: scale(1.1); }
     .card[data-favorited="1"] .fav-btn { color: var(--accent); }
+    @keyframes fav-pulse {
+      0% { transform: scale(1); }
+      40% { transform: scale(1.45); color: var(--accent); }
+      100% { transform: scale(1); }
+    }
+    .card[data-favorited="1"] .fav-btn { animation: fav-pulse .35s ease-out; }
+    .fav-btn.htmx-request { opacity: .55; pointer-events: none; }
     .card[data-status="failed"] { border-color: var(--danger); }
     .card[data-status="queued"], .card[data-status="downloading"] { border-color: var(--accent); }
     .card .thumb { width: 100%; aspect-ratio: 16/9; background: var(--bg-deep); border-radius: 4px; object-fit: cover; }
@@ -752,6 +759,29 @@
       function escape(s) {
         return String(s).replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
       }
+      document.body.addEventListener('wytchr:favorited', (e) => {
+        const s = e.detail || {};
+        const safeTitle = escape(s.title || '');
+        let line;
+        if (s.favorited) {
+          const w = s.webhook_count || 0;
+          const tail = w > 0
+            ? `<strong>${w}</strong> webhook${w === 1 ? '' : 's'} firing`
+            : `<span class="errs">no webhooks configured</span>`;
+          line = `★ favorited <strong>${safeTitle}</strong> · ${tail}`;
+        } else {
+          line = `☆ unfavorited <strong>${safeTitle}</strong>`;
+        }
+        toast.innerHTML = `<button class="close" type="button" aria-label="dismiss">×</button><div class="summary-line">${line}</div>`;
+        toast.hidden = false;
+        toast.classList.remove('fading');
+        toast.querySelector('.close').addEventListener('click', close);
+        if (dismissTimer) clearTimeout(dismissTimer);
+        dismissTimer = setTimeout(() => {
+          toast.classList.add('fading');
+          setTimeout(close, 280);
+        }, 2800);
+      });
       document.body.addEventListener('wytchr:polled', (e) => {
         const s = e.detail || {};
         const errs = Array.isArray(s.errors) ? s.errors : [];
