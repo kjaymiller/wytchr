@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS channel_settings (
   auto_watched_days INTEGER,
   title_include TEXT,
   title_exclude TEXT,
+  include_members_only INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL,
   FOREIGN KEY (channel_name) REFERENCES channels(name) ON DELETE CASCADE
 );
@@ -166,6 +167,11 @@ def init_db():
             db.execute("CREATE INDEX IF NOT EXISTS videos_favorited ON videos(favorited_at DESC)")
         if "description" not in cols:
             db.execute("ALTER TABLE videos ADD COLUMN description TEXT")
+        cs_cols = {r[1] for r in db.execute("PRAGMA table_info(channel_settings)")}
+        if "include_members_only" not in cs_cols:
+            db.execute(
+                "ALTER TABLE channel_settings ADD COLUMN include_members_only INTEGER NOT NULL DEFAULT 0"
+            )
 
 
 # --- Tags -------------------------------------------------------------
@@ -173,7 +179,11 @@ def init_db():
 # yt-dlp's --flat-playlist sets `availability` on entries that are
 # gated. We poll-skip these so they never enter the DB; the operator
 # can't act on them anyway and they'd just be visual noise.
-SKIP_AVAILABILITY = frozenset({"subscriber_only", "premium_only", "needs_auth"})
+# `subscriber_only` is the channel-membership tier — split out so the
+# per-channel `include_members_only` toggle can opt back in for
+# channels where the operator is actually a member.
+MEMBERS_ONLY_AVAILABILITY = frozenset({"subscriber_only"})
+SKIP_AVAILABILITY = frozenset({"premium_only", "needs_auth"}) | MEMBERS_ONLY_AVAILABILITY
 
 
 _CHANNEL_SETTINGS_DEFAULTS = {
@@ -185,6 +195,7 @@ _CHANNEL_SETTINGS_DEFAULTS = {
     "auto_watched_days": None,
     "title_include": None,
     "title_exclude": None,
+    "include_members_only": 0,
 }
 
 
@@ -196,7 +207,7 @@ def _channel_settings_map(db: sqlite3.Connection) -> dict[str, dict]:
     for r in db.execute(
         """SELECT channel_name, display_name, date_range, max_files,
                   include_shorts, hide_channel, auto_watched_days,
-                  title_include, title_exclude
+                  title_include, title_exclude, include_members_only
              FROM channel_settings"""
     ):
         out[r["channel_name"]] = {
@@ -208,6 +219,7 @@ def _channel_settings_map(db: sqlite3.Connection) -> dict[str, dict]:
             "auto_watched_days": r["auto_watched_days"],
             "title_include": r["title_include"],
             "title_exclude": r["title_exclude"],
+            "include_members_only": int(r["include_members_only"] or 0),
         }
     return out
 
@@ -516,15 +528,28 @@ def poll_channel(db: sqlite3.Connection, name: str, url: str) -> tuple[int, str 
             (now, str(exc)[:500], name),
         )
         return 0, str(exc)
+    # Per-channel opt-in for members-only ingest. Default off: most
+    # channels publish member videos the operator can't download, so
+    # they'd just be clutter. Channels the operator is actually a
+    # member of can flip include_members_only=1 in channel settings.
+    row = db.execute(
+        "SELECT include_members_only FROM channel_settings WHERE channel_name = ?",
+        (name,),
+    ).fetchone()
+    include_members_only = bool(row and row["include_members_only"])
     new_count = 0
     for e in entries:
         vid = e.get("id")
         if not vid:
             continue
-        # Members-only / Premium-only / login-walled videos can't be
-        # downloaded by ytdl-sub anyway and would just clutter the
-        # board. Skip at poll-time so they never enter the DB.
-        if e.get("availability") in SKIP_AVAILABILITY:
+        # Premium-only / login-walled videos can't be downloaded by
+        # ytdl-sub anyway. Members-only (`subscriber_only`) is gated
+        # by the per-channel toggle: skip unless the operator opted in.
+        avail = e.get("availability")
+        if avail in MEMBERS_ONLY_AVAILABILITY:
+            if not include_members_only:
+                continue
+        elif avail in SKIP_AVAILABILITY:
             continue
         # Shorts: detected by /shorts/ in the entry URL. Skip at poll
         # time so they never enter the DB — same pattern as the
@@ -1162,7 +1187,7 @@ def _get_channel_settings_row(db: sqlite3.Connection, channel_name: str) -> dict
     r = db.execute(
         """SELECT display_name, date_range, max_files,
                   include_shorts, hide_channel, auto_watched_days,
-                  title_include, title_exclude
+                  title_include, title_exclude, include_members_only
              FROM channel_settings WHERE channel_name = ?""",
         (channel_name,),
     ).fetchone()
@@ -1177,6 +1202,7 @@ def _get_channel_settings_row(db: sqlite3.Connection, channel_name: str) -> dict
         "auto_watched_days": r["auto_watched_days"],
         "title_include": r["title_include"],
         "title_exclude": r["title_exclude"],
+        "include_members_only": int(r["include_members_only"] or 0),
     }
 
 
@@ -1234,6 +1260,7 @@ def channel_settings_save(channel_name: str):
         "auto_watched_days": _opt_int("auto_watched_days"),
         "title_include": _opt_str("title_include"),
         "title_exclude": _opt_str("title_exclude"),
+        "include_members_only": 1 if f.get("include_members_only") else 0,
     }
     # Validate regex patterns up front so a bad pattern fails loudly
     # instead of silently being a no-op at render time.
@@ -1248,8 +1275,8 @@ def channel_settings_save(channel_name: str):
         """INSERT INTO channel_settings
              (channel_name, display_name, date_range, max_files,
               include_shorts, hide_channel, auto_watched_days,
-              title_include, title_exclude, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              title_include, title_exclude, include_members_only, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(channel_name) DO UPDATE SET
              display_name = excluded.display_name,
              date_range = excluded.date_range,
@@ -1259,6 +1286,7 @@ def channel_settings_save(channel_name: str):
              auto_watched_days = excluded.auto_watched_days,
              title_include = excluded.title_include,
              title_exclude = excluded.title_exclude,
+             include_members_only = excluded.include_members_only,
              updated_at = excluded.updated_at""",
         (
             channel_name,
@@ -1270,6 +1298,7 @@ def channel_settings_save(channel_name: str):
             payload["auto_watched_days"],
             payload["title_include"],
             payload["title_exclude"],
+            payload["include_members_only"],
             int(time.time()),
         ),
     )
