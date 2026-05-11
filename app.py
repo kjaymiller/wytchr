@@ -1562,6 +1562,36 @@ def watched_video(video_id: str):
     return jsonify({"ok": True})
 
 
+@app.post("/channels/<channel_name>/mark-watched")
+@auth_required
+def mark_channel_watched(channel_name: str):
+    """Bulk-flip every actionable video in the channel to 'watched'.
+    Mirrors the auto_watched_days sweep but scoped + manual."""
+    db = get_db()
+    if not db.execute("SELECT 1 FROM channels WHERE name = ?", (channel_name,)).fetchone():
+        return ("channel not found", 404)
+    now = int(time.time())
+    cur = db.execute(
+        """UPDATE videos
+              SET status = 'watched', status_changed_at = ?
+            WHERE channel_name = ?
+              AND status IN ('new', 'failed')""",
+        (now, channel_name),
+    )
+    db.commit()
+    marked = cur.rowcount or 0
+    if request.headers.get("HX-Request"):
+        resp = board_partial()
+        if isinstance(resp, str):
+            from flask import make_response
+            resp = make_response(resp)
+        resp.headers["HX-Trigger"] = json.dumps({
+            "wytchr:channel-watched": {"channel": channel_name, "marked": marked}
+        })
+        return resp
+    return jsonify({"ok": True, "marked": marked})
+
+
 @app.post("/videos/<video_id>/unhide")
 @auth_required
 def unhide_video(video_id: str):

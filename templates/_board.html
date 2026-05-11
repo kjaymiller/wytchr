@@ -62,6 +62,15 @@
               <div class="summary-row">
                 <span class="drag-handle" title="drag to move, or click to pick a profile" tabindex="0" role="button" aria-label="move {{ ch.name }} to a different profile">⋮⋮</span>
                 <a class="title" href="{{ ch.url }}" target="_blank" rel="noopener" title="{{ ch.name }}">{{ ch.display_name or ch.name }}</a>
+                {% if not show_hidden and col.actionable %}
+                  <button type="button" class="row-mark-watched"
+                          hx-post="/channels/{{ ch.name }}/mark-watched"
+                          hx-target="#board"
+                          hx-swap="innerHTML"
+                          hx-confirm="Mark all {{ col.actionable }} unwatched video{{ '' if col.actionable == 1 else 's' }} from {{ ch.display_name or ch.name }} as watched?"
+                          title="mark all as watched"
+                          aria-label="mark all videos from {{ ch.name }} as watched">✓</button>
+                {% endif %}
                 <a class="row-settings" href="/channels/{{ ch.name }}/settings" title="channel settings" aria-label="settings for {{ ch.name }}">⚙</a>
               </div>
               <div class="counts">
