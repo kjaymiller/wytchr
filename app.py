@@ -22,6 +22,8 @@ import httpx
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, g, jsonify, redirect, render_template, request
 
+__version__ = "0.8.0"
+
 API_TOKEN = os.environ.get("API_TOKEN", "")
 YTDL_SUB_API_URL = os.environ.get("YTDL_SUB_API_URL", "http://ytdl-sub-api:5000").rstrip("/")
 YTDL_SUB_API_TOKEN = os.environ.get("YTDL_SUB_API_TOKEN", API_TOKEN)
@@ -41,6 +43,11 @@ if not API_TOKEN:
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
+
+
+@app.context_processor
+def inject_version():
+    return {"app_version": __version__}
 
 
 # --- DB ---------------------------------------------------------------
