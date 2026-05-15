@@ -464,7 +464,7 @@
           </label>
         </div>
       </div>
-      <button class="refresh-btn" hx-post="/poll/all" hx-target="#board" hx-swap="innerHTML">
+      <button class="refresh-btn" hx-post="/poll/all" hx-swap="none">
         <span class="refresh-icon" aria-hidden="true">⟳</span>
         <span class="refresh-label-idle">refresh now</span>
         <span class="refresh-label-busy">refreshing…</span>
@@ -803,6 +803,7 @@
         }, 2800);
       });
       document.body.addEventListener('wytchr:polled', (e) => {
+        refreshBoard();
         const s = e.detail || {};
         const errs = Array.isArray(s.errors) ? s.errors : [];
         const parts = [
