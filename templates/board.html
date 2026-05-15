@@ -344,6 +344,23 @@
     .htmx-indicator { display: none; color: var(--muted); }
     .htmx-request .htmx-indicator { display: inline; }
 
+    .refresh-btn { display: inline-flex; align-items: center; gap: .35rem; }
+    .refresh-btn .refresh-icon { display: inline-block; line-height: 1; transform-origin: 50% 50%; }
+    .refresh-btn .refresh-label-busy { display: none; }
+    .refresh-btn.htmx-request { animation: refresh-flash 1s ease-in-out infinite; pointer-events: none; }
+    .refresh-btn.htmx-request .refresh-icon { animation: refresh-spin .9s linear infinite; }
+    .refresh-btn.htmx-request .refresh-label-idle { display: none; }
+    .refresh-btn.htmx-request .refresh-label-busy { display: inline; }
+    @keyframes refresh-spin { to { transform: rotate(360deg); } }
+    @keyframes refresh-flash {
+      0%, 100% { background: var(--card); border-color: var(--accent); }
+      50% { background: var(--accent-soft); border-color: var(--accent); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .refresh-btn.htmx-request { animation: none; }
+      .refresh-btn.htmx-request .refresh-icon { animation: none; }
+    }
+
     /* Tags + filter chips */
     .filter-bar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .75rem; padding: 0 .25rem 1rem; }
     .filter-label { color: var(--muted); font-size: .8rem; }
@@ -447,9 +464,10 @@
           </label>
         </div>
       </div>
-      <button hx-post="/poll/all" hx-target="#board" hx-swap="innerHTML"
-              hx-indicator="#poll-spin">
-        refresh now <span id="poll-spin" class="htmx-indicator">…</span>
+      <button class="refresh-btn" hx-post="/poll/all" hx-target="#board" hx-swap="innerHTML">
+        <span class="refresh-icon" aria-hidden="true">⟳</span>
+        <span class="refresh-label-idle">refresh now</span>
+        <span class="refresh-label-busy">refreshing…</span>
       </button>
     </div>
   </header>
