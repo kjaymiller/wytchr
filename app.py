@@ -2,27 +2,28 @@
 
 Polls each channel registered with ytdl-sub-api, surfaces recent
 uploads in a per-channel column board, and posts a one-off download
-to ytdl-sub-api when the user clicks. SQLite is the only state.
+to ytdl-sub-api when the user clicks. PostgreSQL (Aiven) is the only
+state.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import sys
 import threading
 import time
 from contextlib import contextmanager
 from functools import wraps
-from pathlib import Path
 
 import httpx
+import psycopg
+from psycopg.rows import dict_row
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, g, jsonify, redirect, render_template, request
 
-__version__ = "0.8.2"
+__version__ = "0.9.0"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 YTDL_SUB_API_URL = os.environ.get("YTDL_SUB_API_URL", "http://ytdl-sub-api:5000").rstrip("/")
@@ -31,7 +32,7 @@ YTDL_SUB_API_TOKEN = os.environ.get("YTDL_SUB_API_TOKEN", API_TOKEN)
 # when unset, description-related fields stay NULL but everything else
 # works. The flat-playlist polling path doesn't depend on it.
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
-DB_PATH = Path(os.environ.get("DB_PATH", "/data/wytchr.db"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "30"))
 POLL_LIMIT = int(os.environ.get("POLL_LIMIT", "30"))
 DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "1800"))
@@ -40,7 +41,9 @@ if not API_TOKEN:
     print("FATAL: API_TOKEN env var must be set", file=sys.stderr)
     sys.exit(1)
 
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+if not DATABASE_URL:
+    print("FATAL: DATABASE_URL env var must be set (Postgres URI from install.sh)", file=sys.stderr)
+    sys.exit(1)
 
 app = Flask(__name__)
 
@@ -57,7 +60,7 @@ CREATE TABLE IF NOT EXISTS channels (
   name TEXT PRIMARY KEY,
   url TEXT NOT NULL,
   preset TEXT NOT NULL,
-  last_polled_at INTEGER,
+  last_polled_at BIGINT,
   last_error TEXT
 );
 CREATE TABLE IF NOT EXISTS videos (
@@ -70,45 +73,46 @@ CREATE TABLE IF NOT EXISTS videos (
   url TEXT,
   status TEXT NOT NULL DEFAULT 'new',
   last_output TEXT,
-  seen_at INTEGER NOT NULL,
-  status_changed_at INTEGER NOT NULL
+  seen_at BIGINT NOT NULL,
+  status_changed_at BIGINT NOT NULL,
+  favorited_at BIGINT,
+  description TEXT
 );
 CREATE INDEX IF NOT EXISTS videos_channel_status ON videos(channel_name, status);
 CREATE INDEX IF NOT EXISTS videos_seen ON videos(seen_at DESC);
+CREATE INDEX IF NOT EXISTS videos_favorited ON videos(favorited_at DESC);
 
 -- Outbound webhooks. Fired on `video.favorited` (toggle on); designed
 -- to feed downstream services like all-my-favs.
 CREATE TABLE IF NOT EXISTS webhooks (
-  id INTEGER PRIMARY KEY,
+  id BIGSERIAL PRIMARY KEY,
   name TEXT NOT NULL,
   url TEXT NOT NULL,
   event TEXT NOT NULL DEFAULT 'video.favorited',
   enabled INTEGER NOT NULL DEFAULT 1,
   bearer_token TEXT,
-  created_at INTEGER NOT NULL,
-  last_fired_at INTEGER,
+  created_at BIGINT NOT NULL,
+  last_fired_at BIGINT,
   last_status INTEGER,
   last_error TEXT
 );
 CREATE INDEX IF NOT EXISTS webhooks_event_enabled ON webhooks(event, enabled);
 
+-- Tag names are normalized lowercase before insert (see _normalize_tag),
+-- so a plain UNIQUE on `name` is effectively case-insensitive.
 CREATE TABLE IF NOT EXISTS tags (
-  id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE COLLATE NOCASE
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE
 );
 CREATE TABLE IF NOT EXISTS video_tags (
-  video_id TEXT NOT NULL,
-  tag_id INTEGER NOT NULL,
-  PRIMARY KEY (video_id, tag_id),
-  FOREIGN KEY (video_id) REFERENCES videos(video_id) ON DELETE CASCADE,
-  FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+  video_id TEXT NOT NULL REFERENCES videos(video_id) ON DELETE CASCADE,
+  tag_id BIGINT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+  PRIMARY KEY (video_id, tag_id)
 );
 CREATE TABLE IF NOT EXISTS channel_tags (
-  channel_name TEXT NOT NULL,
-  tag_id INTEGER NOT NULL,
-  PRIMARY KEY (channel_name, tag_id),
-  FOREIGN KEY (channel_name) REFERENCES channels(name) ON DELETE CASCADE,
-  FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+  channel_name TEXT NOT NULL REFERENCES channels(name) ON DELETE CASCADE,
+  tag_id BIGINT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+  PRIMARY KEY (channel_name, tag_id)
 );
 CREATE INDEX IF NOT EXISTS video_tags_tag ON video_tags(tag_id);
 CREATE INDEX IF NOT EXISTS channel_tags_tag ON channel_tags(tag_id);
@@ -117,7 +121,7 @@ CREATE INDEX IF NOT EXISTS channel_tags_tag ON channel_tags(tag_id);
 -- (via preset chain) provides the default. UI surfaces these as a form
 -- on /channels/<name>/settings.
 CREATE TABLE IF NOT EXISTS channel_settings (
-  channel_name TEXT PRIMARY KEY,
+  channel_name TEXT PRIMARY KEY REFERENCES channels(name) ON DELETE CASCADE,
   display_name TEXT,
   date_range TEXT,
   max_files INTEGER,
@@ -127,18 +131,102 @@ CREATE TABLE IF NOT EXISTS channel_settings (
   title_include TEXT,
   title_exclude TEXT,
   include_members_only INTEGER NOT NULL DEFAULT 0,
-  updated_at INTEGER NOT NULL,
-  FOREIGN KEY (channel_name) REFERENCES channels(name) ON DELETE CASCADE
+  updated_at BIGINT NOT NULL
 );
 """
 
 
-def get_db() -> sqlite3.Connection:
+# --- DB compatibility shim -------------------------------------------
+#
+# The codebase was written against sqlite3's surface (`?` placeholders,
+# `db.execute(...).fetchone()`, `INSERT OR IGNORE`, `COLLATE NOCASE`).
+# Rather than rewrite ~150 call sites, we wrap psycopg in a thin shim
+# that translates the dialect at execute time. Trade-off accepted: the
+# string rewrites are O(query) and the substitutions are SQLite-specific,
+# but they're confined here.
+
+_PG_LIKE_SENTINEL = "\x00WYTCHR_PARAM\x00"
+_NOCASE_RE = re.compile(r"\s+COLLATE\s+NOCASE", re.IGNORECASE)
+
+
+def _to_pg_sql(sql: str, has_params: bool) -> str:
+    # ORDER BY ... COLLATE NOCASE → ORDER BY LOWER(...) so case-insensitive
+    # ordering survives the move to PG (which lacks NOCASE).
+    sql = re.sub(
+        r"ORDER BY\s+([\w\.]+)\s+COLLATE\s+NOCASE",
+        r"ORDER BY LOWER(\1)",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    sql = _NOCASE_RE.sub("", sql)
+    # `INSERT OR IGNORE INTO ...` → `INSERT INTO ... ON CONFLICT DO NOTHING`.
+    # Append on the trailing end so it works for both VALUES and SELECT forms.
+    or_ignore = re.search(r"\bINSERT\s+OR\s+IGNORE\b", sql, re.IGNORECASE) is not None
+    if or_ignore:
+        sql = re.sub(r"\bINSERT\s+OR\s+IGNORE\b", "INSERT", sql, flags=re.IGNORECASE)
+        sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+    # SQLite-style `?` → psycopg `%s`. When params are present, also
+    # escape any literal `%` (e.g. inside LIKE '%/shorts/%') so psycopg's
+    # pyformat parser doesn't mistake it for a placeholder.
+    if has_params:
+        sql = sql.replace("?", _PG_LIKE_SENTINEL)
+        sql = sql.replace("%", "%%")
+        sql = sql.replace(_PG_LIKE_SENTINEL, "%s")
+    else:
+        sql = sql.replace("?", "%s")
+    return sql
+
+
+class PgConn:
+    """sqlite3.Connection-shaped wrapper around a psycopg connection."""
+
+    def __init__(self, dsn: str):
+        # autocommit=False keeps the manual commit() pattern the rest of
+        # the code relies on. dict_row makes row["col"] work like
+        # sqlite3.Row.
+        self._conn = psycopg.connect(dsn, row_factory=dict_row, autocommit=False)
+
+    def execute(self, sql: str, params=None):
+        pg_sql = _to_pg_sql(sql, params is not None and params != ())
+        cur = self._conn.cursor()
+        if params is None:
+            cur.execute(pg_sql)
+        else:
+            cur.execute(pg_sql, params)
+        return cur
+
+    def executescript(self, script: str):
+        # Split on `;` and run statements individually — psycopg3's
+        # execute() doesn't reliably handle multi-statement strings.
+        # Strips comment lines so `--` comments don't accidentally
+        # consume a trailing statement.
+        cleaned = "\n".join(
+            line for line in script.splitlines() if not line.strip().startswith("--")
+        )
+        with self._conn.cursor() as cur:
+            for stmt in cleaned.split(";"):
+                if stmt.strip():
+                    cur.execute(_to_pg_sql(stmt, has_params=False))
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+
+# Backwards-compatible alias so type hints elsewhere in the file
+# (`db: sqlite3.Connection`) keep working without churn.
+sqlite3 = type("_sqlite3_shim", (), {"Connection": PgConn, "Row": dict})()
+
+
+def get_db() -> PgConn:
     db = getattr(g, "_db", None)
     if db is None:
-        db = sqlite3.connect(DB_PATH)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA foreign_keys = ON")
+        db = PgConn(DATABASE_URL)
         g._db = db
     return db
 
@@ -153,9 +241,7 @@ def close_db(_exc):
 @contextmanager
 def standalone_db():
     """For background jobs running outside a request context."""
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys = ON")
+    db = PgConn(DATABASE_URL)
     try:
         yield db
         db.commit()
@@ -166,19 +252,16 @@ def standalone_db():
 def init_db():
     with standalone_db() as db:
         db.executescript(SCHEMA)
-        # ALTER-ADD-COLUMN migrations for older DBs. SQLite can't do
-        # ADD COLUMN IF NOT EXISTS, so we introspect first.
-        cols = {r[1] for r in db.execute("PRAGMA table_info(videos)")}
-        if "favorited_at" not in cols:
-            db.execute("ALTER TABLE videos ADD COLUMN favorited_at INTEGER")
-            db.execute("CREATE INDEX IF NOT EXISTS videos_favorited ON videos(favorited_at DESC)")
-        if "description" not in cols:
-            db.execute("ALTER TABLE videos ADD COLUMN description TEXT")
-        cs_cols = {r[1] for r in db.execute("PRAGMA table_info(channel_settings)")}
-        if "include_members_only" not in cs_cols:
-            db.execute(
-                "ALTER TABLE channel_settings ADD COLUMN include_members_only INTEGER NOT NULL DEFAULT 0"
-            )
+        # Idempotent migrations for installs that predate columns added
+        # later. PG supports ADD COLUMN IF NOT EXISTS natively (no need
+        # for the introspection dance SQLite required).
+        db.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS favorited_at BIGINT")
+        db.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS description TEXT")
+        db.execute("CREATE INDEX IF NOT EXISTS videos_favorited ON videos(favorited_at DESC)")
+        db.execute(
+            "ALTER TABLE channel_settings ADD COLUMN IF NOT EXISTS "
+            "include_members_only INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 # --- Tags -------------------------------------------------------------
@@ -656,9 +739,15 @@ def poll_all() -> dict:
             except Exception as exc:  # noqa: BLE001
                 summary["errors"].append(f"sync: {exc}")
             rows = db.execute("SELECT name, url FROM channels").fetchall()
+            db.commit()
             summary["channels"] = len(rows)
             for row in rows:
                 count, err = poll_channel(db, row["name"], row["url"])
+                # Commit per channel so the write lock doesn't sit open
+                # for the whole 30+ second poll cycle. Concurrent
+                # request-path writers (e.g. /board's auto-mark-watched
+                # UPDATE) can interleave instead of timing out.
+                db.commit()
                 summary["new_videos"] += count
                 if err:
                     summary["errors"].append(f"{row['name']}: {err}")

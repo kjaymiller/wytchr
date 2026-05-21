@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# wytchr installer.
+#
+# Provisions Aiven for PostgreSQL via Terraform, then boots wytchr with the
+# resulting connection string injected straight into the container env. The
+# DATABASE_URL is NEVER written to .env or any file on disk by this script.
+#
+# Requires:
+#   1Password CLI signed in (`op whoami`) — token is fetched via `op read`
+#   terraform >= 1.5, docker, docker compose
+#
+# NOTE: Terraform writes infra/terraform.tfstate locally. That state file
+# contains the DB password in plaintext. It is gitignored, but treat it like
+# a secret on this host.
+
+set -euo pipefail
+
+# --provision-only: run terraform, print DATABASE_URL to stdout, skip
+# `docker compose up`. Used by ~/homelab/compose/wytchr/install.sh so the
+# homelab can orchestrate its own deploy after we hand it the DB URL.
+#
+# --infra-dir <path> / $INFRA_DIR: path to the Terraform working directory
+# (where main.tf lives and where .terraform/ + terraform.tfstate will be
+# written). Required. Operational state must NOT live inside this repo —
+# see infra.example/README.md.
+PROVISION_ONLY=0
+INFRA_DIR="${INFRA_DIR:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --provision-only) PROVISION_ONLY=1; shift ;;
+    --infra-dir) INFRA_DIR="$2"; shift 2 ;;
+    --infra-dir=*) INFRA_DIR="${1#*=}"; shift ;;
+    *) echo "error: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+# In provision-only mode, stdout is reserved for the DATABASE_URL payload —
+# redirect all human-readable logging to stderr so callers can capture it
+# cleanly via `DATABASE_URL=$(install.sh --provision-only)`.
+if [[ $PROVISION_ONLY -eq 1 ]]; then
+  exec 3>&2
+else
+  exec 3>&1
+fi
+log() { echo "$@" >&3; }
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ -z "$INFRA_DIR" ]]; then
+  echo "error: --infra-dir <path> (or INFRA_DIR env var) is required." >&2
+  echo "       See infra.example/README.md — operational state must not live in this repo." >&2
+  exit 2
+fi
+if [[ ! -f "$INFRA_DIR/main.tf" ]]; then
+  echo "error: $INFRA_DIR does not contain main.tf" >&2
+  exit 2
+fi
+# Reject the repo's sample dir explicitly — its only job is to be copied.
+case "$INFRA_DIR" in
+  "$REPO_DIR/infra.example"|"$REPO_DIR/infra.example/")
+    echo "error: refusing to run against repo sample dir $INFRA_DIR." >&2
+    echo "       Copy it somewhere you own and point --infra-dir there." >&2
+    exit 2 ;;
+esac
+
+# Override by exporting AIVEN_OP_REF before running.
+AIVEN_OP_REF="${AIVEN_OP_REF:-op://Private/Aiven Homelab API KEY/credential}"
+
+for bin in terraform docker op; do
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    echo "error: '$bin' not found in PATH." >&2
+    exit 1
+  fi
+done
+
+if ! op whoami >/dev/null 2>&1; then
+  echo "error: 1Password CLI is not signed in. Run: eval \$(op signin)" >&2
+  exit 1
+fi
+
+# Fetch the token straight into a shell var. Never written to disk.
+AIVEN_API_TOKEN="$(op read "$AIVEN_OP_REF")"
+if [[ -z "$AIVEN_API_TOKEN" ]]; then
+  echo "error: op read returned empty for $AIVEN_OP_REF" >&2
+  exit 1
+fi
+
+if ! docker compose version >/dev/null 2>&1; then
+  echo "error: 'docker compose' plugin not available." >&2
+  exit 1
+fi
+
+# TF_VAR_* is how we hand the token to terraform without it touching disk
+# or shell history beyond this process tree.
+export TF_VAR_aiven_api_token="$AIVEN_API_TOKEN"
+
+log "==> terraform init"
+terraform -chdir="$INFRA_DIR" init -input=false >&3
+
+log "==> terraform apply (provisioning Aiven for PostgreSQL in jay-miller/do-nyc)"
+terraform -chdir="$INFRA_DIR" apply -auto-approve -input=false >&3
+
+# -raw avoids JSON quoting; capture into a shell var so it stays in memory
+# only. Do NOT echo it, do NOT write it to a file.
+DATABASE_URL="$(terraform -chdir="$INFRA_DIR" output -raw database_url)"
+export DATABASE_URL
+
+if [[ -z "$DATABASE_URL" ]]; then
+  echo "error: terraform did not produce a database_url output." >&2
+  exit 1
+fi
+
+if [[ $PROVISION_ONLY -eq 1 ]]; then
+  # Hand the URL to the caller on stdout. Nothing else touches stdout.
+  printf '%s\n' "$DATABASE_URL"
+  unset DATABASE_URL TF_VAR_aiven_api_token AIVEN_API_TOKEN
+  exit 0
+fi
+
+log "==> docker compose pull (fetch latest image if digest differs)"
+docker compose -f "$REPO_DIR/compose.yml" pull >&3
+
+log "==> docker compose up -d (DATABASE_URL injected via process env only)"
+# Compose interpolates ${DATABASE_URL} from our exported env into the
+# container's environment. Nothing is persisted to .env.
+docker compose -f "$REPO_DIR/compose.yml" up -d >&3
+
+# Scrub from this shell's environment before exit. (Subshell var dies with
+# the script anyway; this is belt-and-suspenders for anyone sourcing it.)
+unset DATABASE_URL TF_VAR_aiven_api_token AIVEN_API_TOKEN
+
+log
+log "wytchr is up. The Postgres connection string lives only in:"
+log "  - infra/terraform.tfstate (gitignored, on this host)"
+log "  - the running wytchr container's env"
+log "Re-run this script to refresh the container with the latest URL."

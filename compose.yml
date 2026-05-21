@@ -7,11 +7,11 @@ services:
       - .env
     environment:
       - TZ=${TZ:-UTC}
-      - DB_PATH=/data/wytchr.db
+      # Provided by install.sh via process env (Aiven PG). Not in .env on
+      # purpose — see install.sh. The app fails fast if unset.
+      - DATABASE_URL=${DATABASE_URL:?DATABASE_URL required — run ./install.sh}
       - YTDL_SUB_API_URL=${YTDL_SUB_API_URL:-http://ytdl-sub-api:5000}
       - POLL_INTERVAL_MINUTES=${POLL_INTERVAL_MINUTES:-30}
       - POLL_LIMIT=${POLL_LIMIT:-30}
     ports:
       - "5000:5000"
-    volumes:
-      - ./data:/data

@@ -6,6 +6,7 @@ RUN uv pip install --system --no-cache \
     "flask==3.*" \
     "apscheduler==3.*" \
     "httpx==0.28.*" \
+    "psycopg[binary]==3.*" \
     "yt-dlp==2026.3.17"
 
 WORKDIR /app
