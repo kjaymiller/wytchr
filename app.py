@@ -3,27 +3,38 @@
 Polls each channel registered with ytdl-sub-api, surfaces recent
 uploads in a per-channel column board, and posts a one-off download
 to ytdl-sub-api when the user clicks. PostgreSQL (Aiven) is the only
-state.
+state. Quart + asyncio: every route is async, DB is psycopg.AsyncConnection,
+HTTP calls are httpx.AsyncClient. The yt-dlp subprocess is the one
+intentionally-sync island — wrapped in asyncio.to_thread at the
+single call site.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import subprocess
 import sys
-import threading
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from functools import wraps
 
 import httpx
 import psycopg
 from psycopg.rows import dict_row
-from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, g, jsonify, redirect, render_template, request
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from quart import (
+    Quart,
+    g,
+    jsonify,
+    make_response,
+    redirect,
+    render_template,
+    request,
+)
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 YTDL_SUB_API_URL = os.environ.get("YTDL_SUB_API_URL", "http://ytdl-sub-api:5000").rstrip("/")
@@ -45,7 +56,14 @@ if not DATABASE_URL:
     print("FATAL: DATABASE_URL env var must be set (Postgres URI from install.sh)", file=sys.stderr)
     sys.exit(1)
 
-app = Flask(__name__)
+app = Quart(__name__)
+
+# Process-wide singletons. Both are created in @app.before_serving so
+# they bind to the running event loop, and torn down in
+# @app.after_serving. Anywhere outside a request that needs HTTP or
+# the scheduler should reach for these.
+_http_client: httpx.AsyncClient | None = None
+_scheduler: AsyncIOScheduler | None = None
 
 
 @app.context_processor
@@ -140,10 +158,11 @@ CREATE TABLE IF NOT EXISTS channel_settings (
 #
 # The codebase was written against sqlite3's surface (`?` placeholders,
 # `db.execute(...).fetchone()`, `INSERT OR IGNORE`, `COLLATE NOCASE`).
-# Rather than rewrite ~150 call sites, we wrap psycopg in a thin shim
-# that translates the dialect at execute time. Trade-off accepted: the
-# string rewrites are O(query) and the substitutions are SQLite-specific,
-# but they're confined here.
+# Rather than rewrite ~150 call sites to native psycopg-async patterns,
+# we wrap psycopg.AsyncConnection in a thin awaitable shim. Call sites
+# add `await` in front of `db.execute(...)` (no fetch) or
+# `db.execute(...).fetchone()` / `.fetchall()` — that's the entire
+# delta from the pre-Quart shape.
 
 _PG_LIKE_SENTINEL = "\x00WYTCHR_PARAM\x00"
 _NOCASE_RE = re.compile(r"\s+COLLATE\s+NOCASE", re.IGNORECASE)
@@ -177,25 +196,62 @@ def _to_pg_sql(sql: str, has_params: bool) -> str:
     return sql
 
 
-class PgConn:
-    """sqlite3.Connection-shaped wrapper around a psycopg connection."""
+class _RowResult:
+    """Awaitable wrapper that lets the call-site shapes
+    `await db.execute(sql)`, `await db.execute(sql).fetchone()`, and
+    `await db.execute(sql).fetchall()` all work without intermediate
+    variables. SQL execution is deferred until first await so the
+    chained `.fetchone()` form doesn't double-execute.
+    """
 
-    def __init__(self, dsn: str):
-        # autocommit=False keeps the manual commit() pattern the rest of
-        # the code relies on. dict_row makes row["col"] work like
-        # sqlite3.Row.
-        self._conn = psycopg.connect(dsn, row_factory=dict_row, autocommit=False)
+    __slots__ = ("_conn", "_sql", "_params", "_cur")
 
-    def execute(self, sql: str, params=None):
+    def __init__(self, conn: psycopg.AsyncConnection, sql: str, params):
+        self._conn = conn
+        self._sql = sql
+        self._params = params
+        self._cur: psycopg.AsyncCursor | None = None
+
+    async def _exec(self):
+        if self._cur is None:
+            cur = self._conn.cursor()
+            if self._params is None:
+                await cur.execute(self._sql)
+            else:
+                await cur.execute(self._sql, self._params)
+            self._cur = cur
+        return self._cur
+
+    def __await__(self):
+        return self._exec().__await__()
+
+    async def fetchone(self):
+        cur = await self._exec()
+        return await cur.fetchone()
+
+    async def fetchall(self):
+        cur = await self._exec()
+        return await cur.fetchall()
+
+
+class AsyncPgConn:
+    """sqlite3.Connection-shaped (async) wrapper around psycopg."""
+
+    def __init__(self, raw: psycopg.AsyncConnection):
+        self._conn = raw
+
+    @classmethod
+    async def connect(cls, dsn: str) -> "AsyncPgConn":
+        raw = await psycopg.AsyncConnection.connect(
+            dsn, row_factory=dict_row, autocommit=False
+        )
+        return cls(raw)
+
+    def execute(self, sql: str, params=None) -> _RowResult:
         pg_sql = _to_pg_sql(sql, params is not None and params != ())
-        cur = self._conn.cursor()
-        if params is None:
-            cur.execute(pg_sql)
-        else:
-            cur.execute(pg_sql, params)
-        return cur
+        return _RowResult(self._conn, pg_sql, params)
 
-    def executescript(self, script: str):
+    async def executescript(self, script: str) -> None:
         # Split on `;` and run statements individually — psycopg3's
         # execute() doesn't reliably handle multi-statement strings.
         # Strips comment lines so `--` comments don't accidentally
@@ -203,62 +259,57 @@ class PgConn:
         cleaned = "\n".join(
             line for line in script.splitlines() if not line.strip().startswith("--")
         )
-        with self._conn.cursor() as cur:
+        async with self._conn.cursor() as cur:
             for stmt in cleaned.split(";"):
                 if stmt.strip():
-                    cur.execute(_to_pg_sql(stmt, has_params=False))
+                    await cur.execute(_to_pg_sql(stmt, has_params=False))
 
-    def commit(self):
-        self._conn.commit()
+    async def commit(self) -> None:
+        await self._conn.commit()
 
-    def rollback(self):
-        self._conn.rollback()
+    async def rollback(self) -> None:
+        await self._conn.rollback()
 
-    def close(self):
-        self._conn.close()
-
-
-# Backwards-compatible alias so type hints elsewhere in the file
-# (`db: sqlite3.Connection`) keep working without churn.
-sqlite3 = type("_sqlite3_shim", (), {"Connection": PgConn, "Row": dict})()
+    async def close(self) -> None:
+        await self._conn.close()
 
 
-def get_db() -> PgConn:
+async def get_db() -> AsyncPgConn:
     db = getattr(g, "_db", None)
     if db is None:
-        db = PgConn(DATABASE_URL)
+        db = await AsyncPgConn.connect(DATABASE_URL)
         g._db = db
     return db
 
 
 @app.teardown_appcontext
-def close_db(_exc):
+async def close_db(_exc):
     db = getattr(g, "_db", None)
     if db is not None:
-        db.close()
+        await db.close()
 
 
-@contextmanager
-def standalone_db():
+@asynccontextmanager
+async def standalone_db():
     """For background jobs running outside a request context."""
-    db = PgConn(DATABASE_URL)
+    db = await AsyncPgConn.connect(DATABASE_URL)
     try:
         yield db
-        db.commit()
+        await db.commit()
     finally:
-        db.close()
+        await db.close()
 
 
-def init_db():
-    with standalone_db() as db:
-        db.executescript(SCHEMA)
+async def init_db() -> None:
+    async with standalone_db() as db:
+        await db.executescript(SCHEMA)
         # Idempotent migrations for installs that predate columns added
         # later. PG supports ADD COLUMN IF NOT EXISTS natively (no need
         # for the introspection dance SQLite required).
-        db.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS favorited_at BIGINT")
-        db.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS description TEXT")
-        db.execute("CREATE INDEX IF NOT EXISTS videos_favorited ON videos(favorited_at DESC)")
-        db.execute(
+        await db.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS favorited_at BIGINT")
+        await db.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS description TEXT")
+        await db.execute("CREATE INDEX IF NOT EXISTS videos_favorited ON videos(favorited_at DESC)")
+        await db.execute(
             "ALTER TABLE channel_settings ADD COLUMN IF NOT EXISTS "
             "include_members_only INTEGER NOT NULL DEFAULT 0"
         )
@@ -289,17 +340,18 @@ _CHANNEL_SETTINGS_DEFAULTS = {
 }
 
 
-def _channel_settings_map(db: sqlite3.Connection) -> dict[str, dict]:
+async def _channel_settings_map(db: AsyncPgConn) -> dict[str, dict]:
     """Fetch every channel's settings row into {name: dict}. Channels
     without a row return defaults via .get(name, _CHANNEL_SETTINGS_DEFAULTS)
     at the call site."""
-    out: dict[str, dict] = {}
-    for r in db.execute(
+    rows = await db.execute(
         """SELECT channel_name, display_name, date_range, max_files,
                   include_shorts, hide_channel, auto_watched_days,
                   title_include, title_exclude, include_members_only
              FROM channel_settings"""
-    ):
+    ).fetchall()
+    out: dict[str, dict] = {}
+    for r in rows:
         out[r["channel_name"]] = {
             "display_name": r["display_name"],
             "date_range": r["date_range"],
@@ -334,6 +386,7 @@ def _is_short(entry: dict) -> bool:
             return True
     return False
 
+
 _TAG_RE = re.compile(r"[^a-z0-9_-]+")
 
 
@@ -353,8 +406,6 @@ def _normalize_tag(name: str) -> str:
         prefix = _TAG_RE.sub("-", prefix).strip("-")
         suffix = _TAG_RE.sub("-", suffix).strip("-")
         if not suffix:
-            # `prefix:` with nothing after — drop the colon and treat
-            # as a plain tag so we don't store a trailing-colon ghost.
             return prefix[:64]
         if not prefix:
             return suffix[:64]
@@ -370,20 +421,20 @@ def _split_tag_prefix(name: str) -> tuple[str, str]:
     return "", name
 
 
-def _upsert_tag(db: sqlite3.Connection, name: str) -> int | None:
+async def _upsert_tag(db: AsyncPgConn, name: str) -> int | None:
     norm = _normalize_tag(name)
     if not norm:
         return None
-    db.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (norm,))
-    row = db.execute("SELECT id FROM tags WHERE name = ?", (norm,)).fetchone()
+    await db.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (norm,))
+    row = await db.execute("SELECT id FROM tags WHERE name = ?", (norm,)).fetchone()
     return row["id"] if row else None
 
 
-def _video_tags_map(db: sqlite3.Connection, video_ids: list[str]) -> dict[str, list[str]]:
+async def _video_tags_map(db: AsyncPgConn, video_ids: list[str]) -> dict[str, list[str]]:
     if not video_ids:
         return {}
     placeholders = ",".join("?" * len(video_ids))
-    rows = db.execute(
+    rows = await db.execute(
         f"""SELECT vt.video_id, t.name
               FROM video_tags vt
               JOIN tags t ON t.id = vt.tag_id
@@ -397,11 +448,11 @@ def _video_tags_map(db: sqlite3.Connection, video_ids: list[str]) -> dict[str, l
     return out
 
 
-def _channel_tags_map(db: sqlite3.Connection, names: list[str]) -> dict[str, list[str]]:
+async def _channel_tags_map(db: AsyncPgConn, names: list[str]) -> dict[str, list[str]]:
     if not names:
         return {}
     placeholders = ",".join("?" * len(names))
-    rows = db.execute(
+    rows = await db.execute(
         f"""SELECT ct.channel_name, t.name
               FROM channel_tags ct
               JOIN tags t ON t.id = ct.tag_id
@@ -427,14 +478,14 @@ def _authed() -> bool:
 
 def auth_required(fn):
     @wraps(fn)
-    def wrapper(*a, **kw):
+    async def wrapper(*a, **kw):
         if not _authed():
             if request.headers.get("HX-Request"):
                 return ("unauthorized", 401)
             if request.method == "GET" and request.accept_mimetypes.accept_html:
                 return redirect("/login")
             return jsonify({"error": "unauthorized"}), 401
-        return fn(*a, **kw)
+        return await fn(*a, **kw)
     return wrapper
 
 
@@ -444,9 +495,21 @@ def _api_headers() -> dict:
     return {"Authorization": f"Bearer {YTDL_SUB_API_TOKEN}"}
 
 
-def fetch_channels_from_api() -> list[dict]:
+def _client() -> httpx.AsyncClient:
+    """Return the process-wide AsyncClient. before_serving must have run."""
+    if _http_client is None:
+        # Defensive: ad-hoc fallback if someone calls this outside the
+        # serving lifecycle (tests, scripts). Caller leaks the client;
+        # acceptable for the one-off path.
+        return httpx.AsyncClient()
+    return _http_client
+
+
+async def fetch_channels_from_api() -> list[dict]:
     """Pull current channel registry from ytdl-sub-api."""
-    r = httpx.get(f"{YTDL_SUB_API_URL}/channels", headers=_api_headers(), timeout=15)
+    r = await _client().get(
+        f"{YTDL_SUB_API_URL}/channels", headers=_api_headers(), timeout=15
+    )
     r.raise_for_status()
     return r.json().get("channels", [])
 
@@ -459,16 +522,17 @@ _PRESETS_CACHE: dict = {"data": None, "fetched_at": 0.0}
 _PRESETS_TTL = 60.0
 
 
-def fetch_presets(force: bool = False) -> dict:
+async def fetch_presets(force: bool = False) -> dict:
     now = time.time()
     if not force and _PRESETS_CACHE["data"] is not None and (now - _PRESETS_CACHE["fetched_at"]) < _PRESETS_TTL:
         return _PRESETS_CACHE["data"]
     try:
-        r = httpx.get(f"{YTDL_SUB_API_URL}/presets", headers=_api_headers(), timeout=10)
+        r = await _client().get(
+            f"{YTDL_SUB_API_URL}/presets", headers=_api_headers(), timeout=10
+        )
         r.raise_for_status()
         data = r.json()
     except Exception:  # noqa: BLE001
-        # Fall back to whatever we last saw, or an empty shell.
         return _PRESETS_CACHE["data"] or {"profiles": [], "profile_details": {}}
     _PRESETS_CACHE["data"] = data
     _PRESETS_CACHE["fetched_at"] = now
@@ -492,9 +556,7 @@ def _parse_date_range(s: str | None) -> int | None:
 
 def _resolve_profile(preset_str: str | None, profile_details: dict) -> str | None:
     """Right-to-left scan of the chain for the first part that names a
-    user-defined profile. Returns None when nothing in the chain
-    matches (e.g., Shape-2 entries whose chain is just the base + a
-    built-in like `Only Recent`)."""
+    user-defined profile."""
     if not preset_str:
         return None
     parts = [p.strip() for p in preset_str.split("|") if p.strip()]
@@ -507,14 +569,9 @@ def _resolve_profile(preset_str: str | None, profile_details: dict) -> str | Non
 def _channel_window(preset_str: str | None, profile_details: dict) -> tuple[int | None, int | None]:
     """Resolve the channel's display window from its preset chain.
 
-    Walks the chain (joined with " | ") right-to-left and returns the
-    first profile that has `only_recent_date_range` or
-    `only_recent_max_files` overrides. Right-to-left because the most-
-    specific profile (e.g. `daily`) is at the tail of the chain and
-    should win over earlier ones.
-
-    Returns (max_age_days, max_files); either may be None if not set
-    by any profile in the chain.
+    Right-to-left because the most-specific profile is at the tail and
+    should win over earlier ones. Returns (max_age_days, max_files);
+    either may be None if not set by any profile in the chain.
     """
     if not preset_str:
         return None, None
@@ -535,14 +592,10 @@ def _channel_window(preset_str: str | None, profile_details: dict) -> tuple[int 
     return None, None
 
 
-def request_download(url: str, preset: str) -> tuple[int, str]:
-    """POST /videos to ytdl-sub-api. Returns (exit_code, output_tail).
-
-    Returns (-1, msg) if the upstream endpoint isn't deployed yet (404)
-    so the UI can show a useful message.
-    """
+async def request_download(url: str, preset: str) -> tuple[int, str]:
+    """POST /videos to ytdl-sub-api. Returns (exit_code, output_tail)."""
     try:
-        r = httpx.post(
+        r = await _client().post(
             f"{YTDL_SUB_API_URL}/videos",
             json={"url": url, "preset": preset},
             headers=_api_headers(),
@@ -563,8 +616,15 @@ def request_download(url: str, preset: str) -> tuple[int, str]:
 
 # --- Polling ----------------------------------------------------------
 
-def _flat_listing(url: str, limit: int) -> list[dict]:
-    """yt-dlp --flat-playlist --dump-json. Each line is one video JSON."""
+def _flat_listing_sync(url: str, limit: int) -> list[dict]:
+    """yt-dlp --flat-playlist --dump-json. One video JSON per line.
+
+    Stays synchronous on purpose — the user's call: every other I/O
+    path is asyncio-native, but spawning yt-dlp is a thread-pool job
+    via asyncio.to_thread. Reasons: yt-dlp's async story is third-party
+    and immature; subprocess.run is rock-solid and the throttling
+    config already lives in the yt-dlp extractor args.
+    """
     cmd = [
         "yt-dlp",
         "--flat-playlist",
@@ -572,9 +632,7 @@ def _flat_listing(url: str, limit: int) -> list[dict]:
         "--ignore-errors",
         # `youtubetab:approximate_date` makes the channel-tab extractor
         # surface relative dates ("2 weeks ago") as a `timestamp` field
-        # on flat-playlist entries. Without this, flat-playlist rows
-        # come back with no upload_date at all and our cutoff window
-        # can't filter them.
+        # on flat-playlist entries.
         "--extractor-args", "youtubetab:approximate_date",
         "-I", f":{limit}",
         url,
@@ -594,6 +652,10 @@ def _flat_listing(url: str, limit: int) -> list[dict]:
     return out
 
 
+async def _flat_listing(url: str, limit: int) -> list[dict]:
+    return await asyncio.to_thread(_flat_listing_sync, url, limit)
+
+
 def _best_thumbnail(entry: dict) -> str | None:
     """Pick a usable thumbnail URL from yt-dlp's flat-playlist entry."""
     thumbs = entry.get("thumbnails") or []
@@ -607,22 +669,19 @@ def _best_thumbnail(entry: dict) -> str | None:
     return None
 
 
-def poll_channel(db: sqlite3.Connection, name: str, url: str) -> tuple[int, str | None]:
+async def poll_channel(db: AsyncPgConn, name: str, url: str) -> tuple[int, str | None]:
     """Returns (new_video_count, error_message)."""
     now = int(time.time())
     try:
-        entries = _flat_listing(url, POLL_LIMIT)
+        entries = await _flat_listing(url, POLL_LIMIT)
     except Exception as exc:  # noqa: BLE001
-        db.execute(
+        await db.execute(
             "UPDATE channels SET last_polled_at = ?, last_error = ? WHERE name = ?",
             (now, str(exc)[:500], name),
         )
         return 0, str(exc)
-    # Per-channel opt-in for members-only ingest. Default off: most
-    # channels publish member videos the operator can't download, so
-    # they'd just be clutter. Channels the operator is actually a
-    # member of can flip include_members_only=1 in channel settings.
-    row = db.execute(
+    # Per-channel opt-in for members-only ingest.
+    row = await db.execute(
         "SELECT include_members_only FROM channel_settings WHERE channel_name = ?",
         (name,),
     ).fetchone()
@@ -632,29 +691,20 @@ def poll_channel(db: sqlite3.Connection, name: str, url: str) -> tuple[int, str 
         vid = e.get("id")
         if not vid:
             continue
-        # Premium-only / login-walled videos can't be downloaded by
-        # ytdl-sub anyway. Members-only (`subscriber_only`) is gated
-        # by the per-channel toggle: skip unless the operator opted in.
         avail = e.get("availability")
         if avail in MEMBERS_ONLY_AVAILABILITY:
             if not include_members_only:
                 continue
         elif avail in SKIP_AVAILABILITY:
             continue
-        # Shorts: detected by /shorts/ in the entry URL. Skip at poll
-        # time so they never enter the DB — same pattern as the
-        # availability gate above.
         if _is_short(e):
             continue
-        existing = db.execute(
+        existing = await db.execute(
             "SELECT status FROM videos WHERE video_id = ?", (vid,)
         ).fetchone()
         title = e.get("title")
         duration = int(e["duration"]) if isinstance(e.get("duration"), (int, float)) else None
         upload_date = e.get("upload_date")
-        # Fallback: yt-dlp's youtubetab extractor (with approximate_date)
-        # often returns `timestamp` instead of `upload_date`. Convert it
-        # to the YYYYMMDD form we already use everywhere else.
         if not upload_date:
             ts = e.get("timestamp")
             if isinstance(ts, (int, float)) and ts > 0:
@@ -663,7 +713,7 @@ def poll_channel(db: sqlite3.Connection, name: str, url: str) -> tuple[int, str 
         thumb = _best_thumbnail(e)
         watch_url = e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
         if existing is None:
-            db.execute(
+            await db.execute(
                 """INSERT INTO videos
                    (video_id, channel_name, title, duration, upload_date,
                     thumbnail_url, url, status, seen_at, status_changed_at)
@@ -672,7 +722,7 @@ def poll_channel(db: sqlite3.Connection, name: str, url: str) -> tuple[int, str 
             )
             new_count += 1
         else:
-            db.execute(
+            await db.execute(
                 """UPDATE videos
                       SET title = COALESCE(?, title),
                           duration = COALESCE(?, duration),
@@ -682,30 +732,25 @@ def poll_channel(db: sqlite3.Connection, name: str, url: str) -> tuple[int, str 
                     WHERE video_id = ?""",
                 (title, duration, upload_date, thumb, watch_url, vid),
             )
-    db.execute(
+    await db.execute(
         "UPDATE channels SET last_polled_at = ?, last_error = NULL WHERE name = ?",
         (now, name),
     )
     return new_count, None
 
 
-def sync_channels_from_api(db: sqlite3.Connection) -> None:
-    """Mirror ytdl-sub-api's channel list into our local table.
-
-    Channels removed upstream are also removed locally; their videos
-    cascade off-board (we filter on join).
-    """
-    remote = fetch_channels_from_api()
+async def sync_channels_from_api(db: AsyncPgConn) -> None:
+    """Mirror ytdl-sub-api's channel list into our local table."""
+    remote = await fetch_channels_from_api()
     seen = set()
     for c in remote:
         name = c.get("name")
         url = c.get("url")
         # ytdl-sub-api returns `preset` as a string for Shape-1 (chained-
         # preset block) channels, but as a list for Shape-2 (standalone
-        # subscription with inline preset chain). SQLite rejects lists, so
-        # the whole sync would fail mid-loop on the first standalone sub.
-        # Coerce to a " | "-joined string — matches the chained-preset key
-        # format used by Shape-1 entries.
+        # subscription with inline preset chain). Coerce to a " | "-joined
+        # string — matches the chained-preset key format used by Shape-1
+        # entries.
         raw_preset = c.get("preset")
         if isinstance(raw_preset, list):
             preset = " | ".join(str(p) for p in raw_preset)
@@ -714,7 +759,7 @@ def sync_channels_from_api(db: sqlite3.Connection) -> None:
         if not name or not url:
             continue
         seen.add(name)
-        db.execute(
+        await db.execute(
             """INSERT INTO channels (name, url, preset)
                VALUES (?, ?, ?)
                ON CONFLICT(name) DO UPDATE SET url = excluded.url, preset = excluded.preset""",
@@ -722,32 +767,46 @@ def sync_channels_from_api(db: sqlite3.Connection) -> None:
         )
     if seen:
         placeholders = ",".join("?" * len(seen))
-        db.execute(
+        await db.execute(
             f"DELETE FROM channels WHERE name NOT IN ({placeholders})",
             tuple(seen),
         )
 
 
-def poll_all() -> dict:
-    """Background task: sync channel list, then poll each channel."""
+# Asyncio-native poll coordinator. `running` is the in-flight flag —
+# both the scheduler and the manual /poll/all route consult it so a
+# user clicking "refresh" mid-cycle doesn't kick a second concurrent
+# poll. `summary` carries the most recent finished run so /poll/status
+# can hand it back to the board, which uses it to fire the existing
+# `wytchr:polled` toast.
+_poll_state: dict = {
+    "running": False,
+    "started_at": None,
+    "summary": None,
+    "summary_id": 0,
+    "task": None,
+}
+_poll_lock = asyncio.Lock()
+
+
+async def _poll_all_impl() -> dict:
+    """Sync channel list, then poll each channel. Caller owns the run-flag."""
     started = time.time()
-    summary = {"channels": 0, "new_videos": 0, "errors": []}
+    summary: dict = {"channels": 0, "new_videos": 0, "errors": []}
     try:
-        with standalone_db() as db:
+        async with standalone_db() as db:
             try:
-                sync_channels_from_api(db)
+                await sync_channels_from_api(db)
             except Exception as exc:  # noqa: BLE001
                 summary["errors"].append(f"sync: {exc}")
-            rows = db.execute("SELECT name, url FROM channels").fetchall()
-            db.commit()
+            rows = await db.execute("SELECT name, url FROM channels").fetchall()
+            await db.commit()
             summary["channels"] = len(rows)
             for row in rows:
-                count, err = poll_channel(db, row["name"], row["url"])
-                # Commit per channel so the write lock doesn't sit open
-                # for the whole 30+ second poll cycle. Concurrent
-                # request-path writers (e.g. /board's auto-mark-watched
-                # UPDATE) can interleave instead of timing out.
-                db.commit()
+                count, err = await poll_channel(db, row["name"], row["url"])
+                # Commit per channel so other writers can interleave
+                # instead of waiting for the whole sweep.
+                await db.commit()
                 summary["new_videos"] += count
                 if err:
                     summary["errors"].append(f"{row['name']}: {err}")
@@ -758,23 +817,75 @@ def poll_all() -> dict:
     return summary
 
 
+async def poll_all() -> dict:
+    """Scheduler entry point. Honors the in-flight guard so a manual
+    refresh doesn't race the next tick."""
+    async with _poll_lock:
+        if _poll_state["running"]:
+            return {"channels": 0, "new_videos": 0, "errors": [],
+                    "elapsed_seconds": 0, "skipped": "already_running"}
+        _poll_state["running"] = True
+        _poll_state["started_at"] = time.time()
+    summary: dict | None = None
+    try:
+        summary = await _poll_all_impl()
+        return summary
+    finally:
+        async with _poll_lock:
+            if summary is not None:
+                _poll_state["summary"] = summary
+                _poll_state["summary_id"] += 1
+            _poll_state["running"] = False
+            _poll_state["started_at"] = None
+
+
+async def _start_poll_async() -> bool:
+    """Kick poll_all as a fire-and-forget task. Returns True if this
+    call actually launched the worker, False if one was already running.
+    The /poll/all route returns immediately so the request worker is
+    freed; the board polls /poll/status to discover completion.
+    """
+    async with _poll_lock:
+        if _poll_state["running"]:
+            return False
+        _poll_state["running"] = True
+        _poll_state["started_at"] = time.time()
+
+    async def _runner():
+        try:
+            summary = await _poll_all_impl()
+        except Exception as exc:  # noqa: BLE001 — defensive; task must not vanish silently
+            summary = {"channels": 0, "new_videos": 0,
+                       "errors": [f"fatal: {exc}"], "elapsed_seconds": 0}
+        async with _poll_lock:
+            _poll_state["summary"] = summary
+            _poll_state["summary_id"] += 1
+            _poll_state["running"] = False
+            _poll_state["started_at"] = None
+            _poll_state["task"] = None
+
+    _poll_state["task"] = asyncio.create_task(_runner(), name="wytchr-poll")
+    return True
+
+
 # --- Routes -----------------------------------------------------------
 
 @app.get("/healthz")
-def healthz():
+async def healthz():
     return jsonify({"ok": True})
 
 
 @app.get("/login")
-def login_form():
-    return render_template("login.html", error=None)
+async def login_form():
+    return await render_template("login.html", error=None)
 
 
 @app.post("/login")
-def login_submit():
-    token = (request.form.get("token") or "").strip()
+async def login_submit():
+    form = await request.form
+    token = (form.get("token") or "").strip()
     if token != API_TOKEN:
-        return render_template("login.html", error="invalid token"), 401
+        return await render_template("login.html", error="invalid token"), 401
     resp = redirect("/")
     resp.set_cookie(
         "wytchr_token", token, httponly=True, samesite="Lax", max_age=60 * 60 * 24 * 30
@@ -784,50 +895,37 @@ def login_submit():
 
 @app.get("/")
 @auth_required
-def index():
-    return render_template("board.html", poll_interval=POLL_INTERVAL_MINUTES)
+async def index():
+    return await render_template("board.html", poll_interval=POLL_INTERVAL_MINUTES)
 
 
 @app.get("/board")
 @auth_required
-def board_partial():
-    db = get_db()
-    channels = db.execute(
+async def board_partial():
+    db = await get_db()
+    channels = await db.execute(
         "SELECT name, url, preset, last_polled_at, last_error FROM channels ORDER BY name COLLATE NOCASE"
     ).fetchall()
     show_hidden = request.args.get("hidden") == "1"
-    # Tag filter — `?tag=foo` narrows the board to channels that either
-    # carry the tag (then show all their videos) or have at least one
-    # video with the tag (then show just those). Channels matching
-    # neither are hidden entirely.
     tag_filter_name = _normalize_tag(request.args.get("tag", ""))
     tag_filter_id: int | None = None
     if tag_filter_name:
-        row = db.execute(
+        row = await db.execute(
             "SELECT id FROM tags WHERE name = ?", (tag_filter_name,)
         ).fetchone()
-        # Sentinel -1 = the requested tag exists in the URL but not in
-        # the DB → match nothing rather than fall through to no-filter.
         tag_filter_id = row["id"] if row else -1
 
     if show_hidden:
         status_filter = ("hidden",)
     else:
-        # wytchr is a *selector*, not a library view: only show videos
-        # the operator hasn't acted on yet. `done` and `hidden` are
-        # already-decided and would just be clutter — their counts
-        # show in the per-channel summary and the global stats bar.
+        # wytchr is a selector, not a library view: only show videos
+        # the operator hasn't acted on yet.
         status_filter = ("new", "queued", "downloading", "failed")
     status_placeholders = ",".join("?" * len(status_filter))
 
-    # Profile-driven display window: each channel's preset chain points
-    # at a profile (daily/long_collection/...) whose only_recent_date_range
-    # and only_recent_max_files become wytchr's "show videos newer than
-    # X / cap at Y" rule. Same fields ytdl-sub uses for download
-    # retention — single source of truth for "what's recent."
-    presets_data = fetch_presets()
+    presets_data = await fetch_presets()
     profile_details = presets_data.get("profile_details") or {}
-    settings_map = _channel_settings_map(db)
+    settings_map = await _channel_settings_map(db)
     from datetime import datetime, timedelta, timezone
     now_dt = datetime.now(timezone.utc)
     now_ts = int(now_dt.timestamp())
@@ -835,25 +933,18 @@ def board_partial():
     columns = []
     for ch in channels:
         cs = settings_map.get(ch["name"], _CHANNEL_SETTINGS_DEFAULTS)
-        # hide_channel: drop from the board entirely. show_hidden bypass
-        # so the operator can find a hidden channel to un-hide it.
         if cs["hide_channel"] and not show_hidden:
             continue
-        # Window resolution: per-channel override wins; profile is the
-        # fallback. days/max_files independently overridable.
         prof_days, prof_max = _channel_window(ch["preset"], profile_details)
         cs_days = _parse_date_range(cs["date_range"]) if cs["date_range"] else None
         days = cs_days if cs_days is not None else prof_days
         cs_max = cs["max_files"]
         max_files = cs_max if (isinstance(cs_max, int) and cs_max > 0) else prof_max
 
-        # Auto-mark watched: any 'new'/'failed' row whose upload_date is
-        # older than the channel's auto_watched_days flips to 'watched'
-        # before counting/listing. Cheap UPDATE, no-op when unset.
         aw = cs["auto_watched_days"]
         if isinstance(aw, int) and aw > 0:
             aw_cutoff = (now_dt - timedelta(days=aw)).strftime("%Y%m%d")
-            db.execute(
+            await db.execute(
                 """UPDATE videos
                       SET status = 'watched', status_changed_at = ?
                     WHERE channel_name = ?
@@ -863,7 +954,6 @@ def board_partial():
                 (now_ts, ch["name"], aw_cutoff),
             )
 
-        # YYYYMMDD lex compare matches yt-dlp's flat-playlist format.
         cutoff = None
         if days is not None:
             cutoff = (now_dt - timedelta(days=days)).strftime("%Y%m%d")
@@ -874,57 +964,37 @@ def board_partial():
         title_inc_re = _compile_title_re(cs["title_include"])
         title_exc_re = _compile_title_re(cs["title_exclude"])
 
-        # Counts: per-status histogram WITHIN the display window so the
-        # summary "5 new" matches what the operator actually sees on the
-        # board. Old videos drop out of view AND out of the counts.
-        # `show_hidden` mode disables the window — operator's auditing
-        # past dismissals.
         if cutoff and not show_hidden:
-            counts = {
-                row["status"]: row["n"]
-                for row in db.execute(
-                    f"""SELECT status, COUNT(*) AS n FROM videos
-                         WHERE channel_name = ?
-                           {shorts_clause_count}
-                           AND upload_date IS NOT NULL
-                           AND upload_date >= ?
-                      GROUP BY status""",
-                    (ch["name"], cutoff),
-                ).fetchall()
-            }
+            count_rows = await db.execute(
+                f"""SELECT status, COUNT(*) AS n FROM videos
+                     WHERE channel_name = ?
+                       {shorts_clause_count}
+                       AND upload_date IS NOT NULL
+                       AND upload_date >= ?
+                  GROUP BY status""",
+                (ch["name"], cutoff),
+            ).fetchall()
         else:
-            counts = {
-                row["status"]: row["n"]
-                for row in db.execute(
-                    f"SELECT status, COUNT(*) AS n FROM videos WHERE channel_name = ? {shorts_clause_count} GROUP BY status",
-                    (ch["name"],),
-                ).fetchall()
-            }
+            count_rows = await db.execute(
+                f"SELECT status, COUNT(*) AS n FROM videos WHERE channel_name = ? {shorts_clause_count} GROUP BY status",
+                (ch["name"],),
+            ).fetchall()
+        counts = {row["status"]: row["n"] for row in count_rows}
         actionable = counts.get("new", 0) + counts.get("failed", 0)
 
-        # Display window predicate: only fold into the SELECT when the
-        # profile actually set a date_range AND we're not in show_hidden
-        # mode. show_hidden bypasses the window so the operator can
-        # audit older dismissals.
         window_clause = ""
         window_args: tuple = ()
         if cutoff and not show_hidden:
-            # Strict: rows with NULL upload_date are excluded. A
-            # seen_at fallback was tried but lets months-old videos
-            # ride a recent poll's seen_at through the window. The
-            # youtubetab:approximate_date extractor-arg now populates
-            # upload_date for new polls; legacy NULL rows just won't
-            # show until they're refreshed (or aged out via cleanup).
             window_clause = " AND v.upload_date IS NOT NULL AND v.upload_date >= ?"
             window_args = (cutoff,)
 
         if tag_filter_id is not None:
-            channel_has_tag = db.execute(
+            channel_has_tag = await db.execute(
                 "SELECT 1 FROM channel_tags WHERE channel_name = ? AND tag_id = ?",
                 (ch["name"], tag_filter_id),
             ).fetchone()
             if channel_has_tag:
-                videos = db.execute(
+                videos = await db.execute(
                     f"""SELECT v.video_id, v.title, v.duration, v.upload_date,
                                v.thumbnail_url, v.url, v.status, v.favorited_at,
                                v.description
@@ -938,7 +1008,7 @@ def board_partial():
                     (ch["name"], *status_filter, *window_args, per_channel_limit),
                 ).fetchall()
             else:
-                videos = db.execute(
+                videos = await db.execute(
                     f"""SELECT v.video_id, v.title, v.duration, v.upload_date,
                                v.thumbnail_url, v.url, v.status, v.favorited_at,
                                v.description
@@ -953,12 +1023,9 @@ def board_partial():
                     (ch["name"], *status_filter, tag_filter_id, *window_args, per_channel_limit),
                 ).fetchall()
                 if not videos:
-                    # No channel-tag and no matching videos — skip the
-                    # whole column. This is the only place we drop a
-                    # channel from the board entirely.
                     continue
         else:
-            videos = db.execute(
+            videos = await db.execute(
                 f"""SELECT v.video_id, v.title, v.duration, v.upload_date,
                            v.thumbnail_url, v.url, v.status
                       FROM videos v
@@ -971,9 +1038,6 @@ def board_partial():
                 (ch["name"], *status_filter, *window_args, per_channel_limit),
             ).fetchall()
 
-        # Title-regex post-filter. Done in Python so the operator can
-        # paste any Python regex; SQLite's LIKE is too coarse and
-        # binding REGEXP would mean shipping a sqlite3 extension.
         if title_inc_re or title_exc_re:
             kept = []
             for v in videos:
@@ -999,19 +1063,13 @@ def board_partial():
                 "default_open": default_open,
             }
         )
-    # Persist any auto-mark-watched flips done in the channel loop.
-    db.commit()
+    await db.commit()
 
-    # Group columns by their profile so the board renders one section
-    # per profile + a trailing "ungrouped" bucket for Shape-2 / no-
-    # profile subscriptions. Section order tracks profile_details
-    # insertion order from /presets, with the empty-key bucket last.
     sections: list[dict] = []
     section_idx: dict[str, int] = {}
     for profile_name in profile_details:
         section_idx[profile_name] = len(sections)
         sections.append({"profile": profile_name, "columns": []})
-    # ungrouped bucket: created on demand
     for col in columns:
         profile_name = _resolve_profile(col["channel"]["preset"], profile_details)
         if profile_name and profile_name in section_idx:
@@ -1021,26 +1079,16 @@ def board_partial():
                 section_idx[""] = len(sections)
                 sections.append({"profile": "", "columns": []})
             sections[section_idx[""]]["columns"].append(col)
-    # Within each section, sink channels with no visible videos to
-    # the bottom — actionable rows float up, "caught up" / empty rows
-    # collect at the end. Stable sort preserves the API's channel
-    # order within each bucket.
     for section in sections:
         section["columns"].sort(key=lambda c: 0 if c["videos"] else 1)
-    # Drop empty sections from a tag-filtered view, but always keep
-    # them visible when no filter is active so they can be drop
-    # targets for empty profiles.
     if tag_filter_name:
         sections = [s for s in sections if s["columns"]]
 
-    # Tag maps for inline chip rendering on cards + summaries. One
-    # query each, joined to tag names.
     all_video_ids = [v["video_id"] for col in columns for v in col["videos"]]
-    video_tags_map = _video_tags_map(db, all_video_ids)
-    channel_tags_map = _channel_tags_map(db, [c["channel"]["name"] for c in columns])
+    video_tags_map = await _video_tags_map(db, all_video_ids)
+    channel_tags_map = await _channel_tags_map(db, [c["channel"]["name"] for c in columns])
 
-    # All tags + their use-counts for the filter chip bar.
-    all_tags = db.execute(
+    all_tags = await db.execute(
         """SELECT t.name,
                   (SELECT COUNT(*) FROM video_tags WHERE tag_id = t.id) AS video_count,
                   (SELECT COUNT(*) FROM channel_tags WHERE tag_id = t.id) AS channel_count
@@ -1048,9 +1096,6 @@ def board_partial():
          ORDER BY t.name COLLATE NOCASE"""
     ).fetchall()
 
-    # Group by `prefix:suffix` convention. Plain tags land under "".
-    # Insertion order = alphabetic from the SELECT above, so iterating
-    # the dict yields a stable, sorted display order.
     grouped_tags: dict[str, list] = {}
     for t in all_tags:
         prefix, suffix = _split_tag_prefix(t["name"])
@@ -1062,7 +1107,7 @@ def board_partial():
         })
 
     totals = {
-        "channels": len(channels),  # global count, not filtered count
+        "channels": len(channels),
         "videos": sum(sum(c["counts"].values()) for c in columns),
         "new": sum(c["counts"].get("new", 0) for c in columns),
         "failed": sum(c["counts"].get("failed", 0) for c in columns),
@@ -1070,7 +1115,7 @@ def board_partial():
         "done": sum(c["counts"].get("done", 0) for c in columns),
         "watched": sum(c["counts"].get("watched", 0) for c in columns),
     }
-    return render_template(
+    return await render_template(
         "_board.html",
         columns=columns,
         sections=sections,
@@ -1085,111 +1130,109 @@ def board_partial():
     )
 
 
-def _name_from_request() -> str:
+async def _name_from_request() -> str:
     if request.is_json:
-        return ((request.get_json(silent=True) or {}).get("name") or "").strip()
-    return (request.form.get("name") or "").strip()
+        body = await request.get_json(silent=True)
+        return ((body or {}).get("name") or "").strip()
+    form = await request.form
+    return (form.get("name") or "").strip()
 
 
-def _render_video_tags(db: sqlite3.Connection, video_id: str):
-    tags = [
-        r["name"]
-        for r in db.execute(
-            """SELECT t.name FROM video_tags vt
-                 JOIN tags t ON t.id = vt.tag_id
-                WHERE vt.video_id = ?
-             ORDER BY t.name COLLATE NOCASE""",
-            (video_id,),
-        ).fetchall()
-    ]
-    return render_template("_tags_video.html", video_id=video_id, tags=tags)
+async def _render_video_tags(db: AsyncPgConn, video_id: str):
+    rows = await db.execute(
+        """SELECT t.name FROM video_tags vt
+             JOIN tags t ON t.id = vt.tag_id
+            WHERE vt.video_id = ?
+         ORDER BY t.name COLLATE NOCASE""",
+        (video_id,),
+    ).fetchall()
+    tags = [r["name"] for r in rows]
+    return await render_template("_tags_video.html", video_id=video_id, tags=tags)
 
 
-def _render_channel_tags(db: sqlite3.Connection, channel_name: str):
-    tags = [
-        r["name"]
-        for r in db.execute(
-            """SELECT t.name FROM channel_tags ct
-                 JOIN tags t ON t.id = ct.tag_id
-                WHERE ct.channel_name = ?
-             ORDER BY t.name COLLATE NOCASE""",
-            (channel_name,),
-        ).fetchall()
-    ]
-    return render_template("_tags_channel.html", channel_name=channel_name, tags=tags)
+async def _render_channel_tags(db: AsyncPgConn, channel_name: str):
+    rows = await db.execute(
+        """SELECT t.name FROM channel_tags ct
+             JOIN tags t ON t.id = ct.tag_id
+            WHERE ct.channel_name = ?
+         ORDER BY t.name COLLATE NOCASE""",
+        (channel_name,),
+    ).fetchall()
+    tags = [r["name"] for r in rows]
+    return await render_template("_tags_channel.html", channel_name=channel_name, tags=tags)
 
 
 @app.post("/videos/<video_id>/tags")
 @auth_required
-def add_video_tag(video_id: str):
-    db = get_db()
-    if not db.execute("SELECT 1 FROM videos WHERE video_id = ?", (video_id,)).fetchone():
+async def add_video_tag(video_id: str):
+    db = await get_db()
+    if not await db.execute("SELECT 1 FROM videos WHERE video_id = ?", (video_id,)).fetchone():
         return ("video not found", 404)
-    tag_id = _upsert_tag(db, _name_from_request())
+    tag_id = await _upsert_tag(db, await _name_from_request())
     if tag_id is None:
-        return _render_video_tags(db, video_id)
-    db.execute(
+        return await _render_video_tags(db, video_id)
+    await db.execute(
         "INSERT OR IGNORE INTO video_tags (video_id, tag_id) VALUES (?, ?)",
         (video_id, tag_id),
     )
-    db.commit()
-    return _render_video_tags(db, video_id)
+    await db.commit()
+    return await _render_video_tags(db, video_id)
 
 
 @app.delete("/videos/<video_id>/tags/<tag_name>")
 @auth_required
-def delete_video_tag(video_id: str, tag_name: str):
-    db = get_db()
+async def delete_video_tag(video_id: str, tag_name: str):
+    db = await get_db()
     norm = _normalize_tag(tag_name)
-    db.execute(
+    await db.execute(
         """DELETE FROM video_tags
                  WHERE video_id = ?
                    AND tag_id = (SELECT id FROM tags WHERE name = ?)""",
         (video_id, norm),
     )
-    db.commit()
-    return _render_video_tags(db, video_id)
+    await db.commit()
+    return await _render_video_tags(db, video_id)
 
 
 @app.post("/channels/<channel_name>/tags")
 @auth_required
-def add_channel_tag(channel_name: str):
-    db = get_db()
-    if not db.execute(
+async def add_channel_tag(channel_name: str):
+    db = await get_db()
+    if not await db.execute(
         "SELECT 1 FROM channels WHERE name = ?", (channel_name,)
     ).fetchone():
         return ("channel not found", 404)
-    tag_id = _upsert_tag(db, _name_from_request())
+    tag_id = await _upsert_tag(db, await _name_from_request())
     if tag_id is None:
-        return _render_channel_tags(db, channel_name)
-    db.execute(
+        return await _render_channel_tags(db, channel_name)
+    await db.execute(
         "INSERT OR IGNORE INTO channel_tags (channel_name, tag_id) VALUES (?, ?)",
         (channel_name, tag_id),
     )
-    db.commit()
-    return _render_channel_tags(db, channel_name)
+    await db.commit()
+    return await _render_channel_tags(db, channel_name)
 
 
 @app.delete("/channels/<channel_name>/tags/<tag_name>")
 @auth_required
-def delete_channel_tag(channel_name: str, tag_name: str):
-    db = get_db()
+async def delete_channel_tag(channel_name: str, tag_name: str):
+    db = await get_db()
     norm = _normalize_tag(tag_name)
-    db.execute(
+    await db.execute(
         """DELETE FROM channel_tags
                  WHERE channel_name = ?
                    AND tag_id = (SELECT id FROM tags WHERE name = ?)""",
         (channel_name, norm),
     )
-    db.commit()
-    return _render_channel_tags(db, channel_name)
+    await db.commit()
+    return await _render_channel_tags(db, channel_name)
 
 
 @app.get("/tags")
 @auth_required
-def tags_admin():
-    db = get_db()
-    rows = db.execute(
+async def tags_admin():
+    db = await get_db()
+    rows = await db.execute(
         """SELECT t.id, t.name,
                   (SELECT COUNT(*) FROM video_tags WHERE tag_id = t.id) AS video_count,
                   (SELECT COUNT(*) FROM channel_tags WHERE tag_id = t.id) AS channel_count
@@ -1207,35 +1250,25 @@ def tags_admin():
             "channel_count": r["channel_count"],
         })
     flash = request.args.get("flash") or ""
-    return render_template("tags.html", grouped=grouped, flash=flash)
+    return await render_template("tags.html", grouped=grouped, flash=flash)
 
 
 @app.post("/channels/<channel_name>/profile")
 @auth_required
-def channel_change_profile(channel_name: str):
-    """Reassign a channel's profile (DELETE + POST upstream).
-
-    Body: {profile: "long_collection"} — empty string / missing
-    profile drops the channel back to the base preset (no chain).
-    Failure mode: if DELETE succeeds but POST fails, the channel is
-    briefly unsubscribed; we surface the error so the operator can
-    retry from the same UI without losing the URL.
-    """
-    body = request.get_json(silent=True) or {}
+async def channel_change_profile(channel_name: str):
+    """Reassign a channel's profile (DELETE + POST upstream)."""
+    body = await request.get_json(silent=True) or {}
     new_profile = (body.get("profile") or "").strip()
-    db = get_db()
-    row = db.execute(
+    db = await get_db()
+    row = await db.execute(
         "SELECT url FROM channels WHERE name = ?", (channel_name,)
     ).fetchone()
     if not row:
         return jsonify({"error": "channel not found in wytchr DB"}), 404
     url = row["url"]
 
-    # DELETE — 404 is fine (e.g. operator already removed it elsewhere
-    # and we're catching up). 200 is success. Anything else aborts so
-    # we don't double-up subscriptions.
     try:
-        d = httpx.delete(
+        d = await _client().delete(
             f"{YTDL_SUB_API_URL}/channels/{channel_name}",
             headers=_api_headers(), timeout=15,
         )
@@ -1248,7 +1281,7 @@ def channel_change_profile(channel_name: str):
     if new_profile:
         payload["profile"] = new_profile
     try:
-        p = httpx.post(
+        p = await _client().post(
             f"{YTDL_SUB_API_URL}/channels",
             headers=_api_headers(), json=payload, timeout=15,
         )
@@ -1261,26 +1294,21 @@ def channel_change_profile(channel_name: str):
             err = p.text[:200]
         return jsonify({"error": err, "stranded": True, "status": p.status_code}), 502
 
-    # Mirror the new preset into wytchr's channels table so the next
-    # /board render lands the channel in the right section without
-    # waiting for sync_channels_from_api.
-    presets_data = fetch_presets(force=True)
+    presets_data = await fetch_presets(force=True)
     base = presets_data.get("base_preset", "")
     new_preset = f"{base} | {new_profile}" if new_profile else base
-    db.execute(
+    await db.execute(
         "UPDATE channels SET preset = ? WHERE name = ?",
         (new_preset, channel_name),
     )
-    db.commit()
+    await db.commit()
     return jsonify({"ok": True, "preset": new_preset})
 
 
 # --- Per-channel settings ---------------------------------------------
 
-def _get_channel_settings_row(db: sqlite3.Connection, channel_name: str) -> dict:
-    """Return current settings (or defaults) for one channel. Always
-    returns a dict — call sites can `.get()` without a None check."""
-    r = db.execute(
+async def _get_channel_settings_row(db: AsyncPgConn, channel_name: str) -> dict:
+    r = await db.execute(
         """SELECT display_name, date_range, max_files,
                   include_shorts, hide_channel, auto_watched_days,
                   title_include, title_exclude, include_members_only
@@ -1304,18 +1332,18 @@ def _get_channel_settings_row(db: sqlite3.Connection, channel_name: str) -> dict
 
 @app.get("/channels/<channel_name>/settings")
 @auth_required
-def channel_settings_page(channel_name: str):
-    db = get_db()
-    ch = db.execute(
+async def channel_settings_page(channel_name: str):
+    db = await get_db()
+    ch = await db.execute(
         "SELECT name, url, preset FROM channels WHERE name = ?", (channel_name,)
     ).fetchone()
     if not ch:
         return ("channel not found", 404)
-    settings = _get_channel_settings_row(db, channel_name)
-    presets_data = fetch_presets()
+    settings = await _get_channel_settings_row(db, channel_name)
+    presets_data = await fetch_presets()
     profile_details = presets_data.get("profile_details") or {}
     prof_days, prof_max = _channel_window(ch["preset"], profile_details)
-    return render_template(
+    return await render_template(
         "channel_settings.html",
         channel=ch,
         settings=settings,
@@ -1327,11 +1355,11 @@ def channel_settings_page(channel_name: str):
 
 @app.post("/channels/<channel_name>/settings")
 @auth_required
-def channel_settings_save(channel_name: str):
-    db = get_db()
-    if not db.execute("SELECT 1 FROM channels WHERE name = ?", (channel_name,)).fetchone():
+async def channel_settings_save(channel_name: str):
+    db = await get_db()
+    if not await db.execute("SELECT 1 FROM channels WHERE name = ?", (channel_name,)).fetchone():
         return ("channel not found", 404)
-    f = request.form
+    f = await request.form
 
     def _opt_str(key: str) -> str | None:
         v = (f.get(key) or "").strip()
@@ -1358,16 +1386,13 @@ def channel_settings_save(channel_name: str):
         "title_exclude": _opt_str("title_exclude"),
         "include_members_only": 1 if f.get("include_members_only") else 0,
     }
-    # Validate regex patterns up front so a bad pattern fails loudly
-    # instead of silently being a no-op at render time.
     for key in ("title_include", "title_exclude"):
         if payload[key] and _compile_title_re(payload[key]) is None:
             return (f"invalid regex for {key}: {payload[key]}", 400)
-    # Validate date_range against the same parser used for the window.
     if payload["date_range"] and _parse_date_range(payload["date_range"]) is None:
-        return (f"invalid date_range (try '7days', '2weeks', '6months', '1year')", 400)
+        return ("invalid date_range (try '7days', '2weeks', '6months', '1year')", 400)
 
-    db.execute(
+    await db.execute(
         """INSERT INTO channel_settings
              (channel_name, display_name, date_range, max_files,
               include_shorts, hide_channel, auto_watched_days,
@@ -1398,7 +1423,7 @@ def channel_settings_save(channel_name: str):
             int(time.time()),
         ),
     )
-    db.commit()
+    await db.commit()
     return redirect(f"/channels/{channel_name}/settings?saved=1")
 
 
@@ -1410,8 +1435,8 @@ def _split_csv(s: str) -> list[str]:
 
 @app.get("/presets")
 @auth_required
-def presets_admin():
-    data = fetch_presets(force=True)
+async def presets_admin():
+    data = await fetch_presets(force=True)
     profile_details = data.get("profile_details") or {}
     base_preset = data.get("base_preset", "")
     profiles = []
@@ -1423,14 +1448,11 @@ def presets_admin():
             "overrides": overrides,
             "date_range": overrides.get("only_recent_date_range") or "",
             "max_files": overrides.get("only_recent_max_files"),
-            # Other override keys, rendered as a textarea so the user
-            # can keep arbitrary ytdl-sub overrides without us
-            # second-guessing the schema.
             "extra": {k: v for k, v in overrides.items() if k not in ("only_recent_date_range", "only_recent_max_files")},
         })
     flash = request.args.get("flash") or ""
     flash_kind = request.args.get("kind") or "ok"
-    return render_template(
+    return await render_template(
         "presets.html",
         profiles=profiles,
         base_preset=base_preset,
@@ -1439,22 +1461,20 @@ def presets_admin():
     )
 
 
-def _overrides_from_form() -> dict:
-    """Reconstruct an overrides dict from the admin form: the two
-    visible fields plus a freeform `extra` textarea (`key=value` per
-    line). Empty values are dropped so the upstream PATCH can clear a
-    field by sending an empty `overrides`."""
+async def _overrides_from_form() -> dict:
+    """Reconstruct an overrides dict from the admin form."""
     out: dict = {}
-    date_range = (request.form.get("date_range") or "").strip()
+    f = await request.form
+    date_range = (f.get("date_range") or "").strip()
     if date_range:
         out["only_recent_date_range"] = date_range
-    max_files_raw = (request.form.get("max_files") or "").strip()
+    max_files_raw = (f.get("max_files") or "").strip()
     if max_files_raw:
         try:
             out["only_recent_max_files"] = int(max_files_raw)
         except ValueError:
             pass
-    extra = request.form.get("extra") or ""
+    extra = f.get("extra") or ""
     for line in extra.splitlines():
         line = line.strip()
         if not line or "=" not in line:
@@ -1464,7 +1484,6 @@ def _overrides_from_form() -> dict:
         v = v.strip()
         if not k:
             continue
-        # Try to coerce numeric, otherwise leave as string.
         try:
             out[k] = int(v)
         except ValueError:
@@ -1477,13 +1496,14 @@ def _overrides_from_form() -> dict:
 
 @app.post("/presets/create")
 @auth_required
-def presets_create():
-    name = (request.form.get("name") or "").strip()
-    parents = _split_csv(request.form.get("parents") or "")
-    overrides = _overrides_from_form()
+async def presets_create():
+    f = await request.form
+    name = (f.get("name") or "").strip()
+    parents = _split_csv(f.get("parents") or "")
+    overrides = await _overrides_from_form()
     payload = {"name": name, "parents": parents, "overrides": overrides}
     try:
-        r = httpx.post(
+        r = await _client().post(
             f"{YTDL_SUB_API_URL}/presets",
             headers=_api_headers(),
             json=payload,
@@ -1491,7 +1511,7 @@ def presets_create():
         )
     except Exception as exc:  # noqa: BLE001
         return redirect(f"/presets?kind=err&flash=upstream+unreachable:+{exc}")
-    fetch_presets(force=True)  # bust cache so the page reflects truth
+    await fetch_presets(force=True)
     if r.status_code == 201:
         return redirect(f"/presets?flash=created+{name}")
     body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
@@ -1500,12 +1520,13 @@ def presets_create():
 
 @app.post("/presets/<name>/update")
 @auth_required
-def presets_update(name: str):
-    parents = _split_csv(request.form.get("parents") or "")
-    overrides = _overrides_from_form()
+async def presets_update(name: str):
+    f = await request.form
+    parents = _split_csv(f.get("parents") or "")
+    overrides = await _overrides_from_form()
     payload = {"parents": parents, "overrides": overrides}
     try:
-        r = httpx.patch(
+        r = await _client().patch(
             f"{YTDL_SUB_API_URL}/presets/{name}",
             headers=_api_headers(),
             json=payload,
@@ -1513,7 +1534,7 @@ def presets_update(name: str):
         )
     except Exception as exc:  # noqa: BLE001
         return redirect(f"/presets?kind=err&flash=upstream+unreachable:+{exc}")
-    fetch_presets(force=True)
+    await fetch_presets(force=True)
     if r.status_code == 200:
         return redirect(f"/presets?flash=updated+{name}")
     body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
@@ -1522,16 +1543,16 @@ def presets_update(name: str):
 
 @app.post("/presets/<name>/delete")
 @auth_required
-def presets_delete(name: str):
+async def presets_delete(name: str):
     try:
-        r = httpx.delete(
+        r = await _client().delete(
             f"{YTDL_SUB_API_URL}/presets/{name}",
             headers=_api_headers(),
             timeout=15,
         )
     except Exception as exc:  # noqa: BLE001
         return redirect(f"/presets?kind=err&flash=upstream+unreachable:+{exc}")
-    fetch_presets(force=True)
+    await fetch_presets(force=True)
     if r.status_code == 200:
         return redirect(f"/presets?flash=deleted+{name}")
     if r.status_code == 409:
@@ -1546,93 +1567,111 @@ def presets_delete(name: str):
 
 @app.post("/tags/create")
 @auth_required
-def create_tag():
-    raw = (request.form.get("name") or "").strip()
+async def create_tag():
+    f = await request.form
+    raw = (f.get("name") or "").strip()
     norm = _normalize_tag(raw)
     if not norm:
         return redirect("/tags?flash=invalid+name")
-    db = get_db()
-    existing = db.execute("SELECT 1 FROM tags WHERE name = ?", (norm,)).fetchone()
+    db = await get_db()
+    existing = await db.execute("SELECT 1 FROM tags WHERE name = ?", (norm,)).fetchone()
     if existing:
         return redirect(f"/tags?flash=tag+{norm}+already+exists")
-    _upsert_tag(db, norm)
-    db.commit()
+    await _upsert_tag(db, norm)
+    await db.commit()
     return redirect(f"/tags?flash=created+{norm}")
 
 
 @app.post("/tags/<old_name>/rename")
 @auth_required
-def rename_tag(old_name: str):
-    new_raw = (request.form.get("new_name") or "").strip()
+async def rename_tag(old_name: str):
+    f = await request.form
+    new_raw = (f.get("new_name") or "").strip()
     new_norm = _normalize_tag(new_raw)
     if not new_norm:
-        return redirect(f"/tags?flash=invalid+name")
-    db = get_db()
-    old_row = db.execute("SELECT id FROM tags WHERE name = ?", (old_name,)).fetchone()
+        return redirect("/tags?flash=invalid+name")
+    db = await get_db()
+    old_row = await db.execute("SELECT id FROM tags WHERE name = ?", (old_name,)).fetchone()
     if not old_row:
-        return redirect(f"/tags?flash=tag+not+found")
+        return redirect("/tags?flash=tag+not+found")
     if old_name == new_norm:
         return redirect("/tags")
     old_id = old_row["id"]
-    existing = db.execute(
+    existing = await db.execute(
         "SELECT id FROM tags WHERE name = ?", (new_norm,)
     ).fetchone()
     if existing and existing["id"] != old_id:
         # Merge: repoint joins from old → existing, drop the old tag.
-        # INSERT OR IGNORE skips rows that would duplicate the new
-        # composite key; the subsequent DELETE clears the old half.
         keep_id = existing["id"]
-        db.execute(
+        await db.execute(
             "INSERT OR IGNORE INTO video_tags (video_id, tag_id) "
             "SELECT video_id, ? FROM video_tags WHERE tag_id = ?",
             (keep_id, old_id),
         )
-        db.execute("DELETE FROM video_tags WHERE tag_id = ?", (old_id,))
-        db.execute(
+        await db.execute("DELETE FROM video_tags WHERE tag_id = ?", (old_id,))
+        await db.execute(
             "INSERT OR IGNORE INTO channel_tags (channel_name, tag_id) "
             "SELECT channel_name, ? FROM channel_tags WHERE tag_id = ?",
             (keep_id, old_id),
         )
-        db.execute("DELETE FROM channel_tags WHERE tag_id = ?", (old_id,))
-        db.execute("DELETE FROM tags WHERE id = ?", (old_id,))
-        db.commit()
+        await db.execute("DELETE FROM channel_tags WHERE tag_id = ?", (old_id,))
+        await db.execute("DELETE FROM tags WHERE id = ?", (old_id,))
+        await db.commit()
         return redirect(f"/tags?flash=merged+into+{new_norm}")
-    db.execute("UPDATE tags SET name = ? WHERE id = ?", (new_norm, old_id))
-    db.commit()
+    await db.execute("UPDATE tags SET name = ? WHERE id = ?", (new_norm, old_id))
+    await db.commit()
     return redirect(f"/tags?flash=renamed+to+{new_norm}")
 
 
 @app.post("/tags/<name>/delete")
 @auth_required
-def delete_tag(name: str):
-    db = get_db()
-    db.execute("DELETE FROM tags WHERE name = ?", (name,))
-    db.commit()
+async def delete_tag(name: str):
+    db = await get_db()
+    await db.execute("DELETE FROM tags WHERE name = ?", (name,))
+    await db.commit()
     return redirect(f"/tags?flash=deleted+{name}")
 
 
 @app.post("/poll/all")
 @auth_required
-def poll_all_route():
-    summary = poll_all()
+async def poll_all_route():
+    """Kick poll_all as a background task; return immediately. The board
+    polls /poll/status until the run lands, then fires the existing
+    wytchr:polled toast. Frees the worker so the page stays interactive
+    during the 30+s sweep.
+    """
+    started = await _start_poll_async()
+    async with _poll_lock:
+        state = {
+            "running": _poll_state["running"],
+            "started": started,
+            "summary_id": _poll_state["summary_id"],
+        }
     if request.headers.get("HX-Request"):
-        resp = board_partial()
-        # Surface the run summary client-side via HX-Trigger; the
-        # board.html toast handler picks `wytchr:polled` up and shows a
-        # short banner with channels / new / errors / elapsed.
-        if isinstance(resp, str):
-            from flask import make_response
-            resp = make_response(resp)
-        resp.headers["HX-Trigger"] = json.dumps({"wytchr:polled": summary})
+        resp = await make_response("", 204)
+        resp.headers["HX-Trigger"] = json.dumps({"wytchr:polling-started": state})
         return resp
-    return jsonify(summary)
+    return jsonify(state)
+
+
+@app.get("/poll/status")
+@auth_required
+async def poll_status_route():
+    async with _poll_lock:
+        payload = {
+            "running": _poll_state["running"],
+            "started_at": _poll_state["started_at"],
+            "summary_id": _poll_state["summary_id"],
+            "summary": _poll_state["summary"],
+        }
+    return jsonify(payload)
 
 
 @app.post("/videos/<video_id>/download")
 @auth_required
-def download_video(video_id: str):
-    db = get_db()
-    row = db.execute(
+async def download_video(video_id: str):
+    db = await get_db()
+    row = await db.execute(
         """SELECT v.url, v.channel_name, c.preset
              FROM videos v
              JOIN channels c ON c.name = v.channel_name
@@ -1642,32 +1681,32 @@ def download_video(video_id: str):
     if not row:
         return jsonify({"error": "video not found"}), 404
     now = int(time.time())
-    db.execute(
+    await db.execute(
         "UPDATE videos SET status = 'queued', status_changed_at = ? WHERE video_id = ?",
         (now, video_id),
     )
-    db.commit()
-    exit_code, output = request_download(row["url"], row["preset"])
+    await db.commit()
+    exit_code, output = await request_download(row["url"], row["preset"])
     final_status = "done" if exit_code == 0 else "failed"
-    db.execute(
+    await db.execute(
         "UPDATE videos SET status = ?, last_output = ?, status_changed_at = ? WHERE video_id = ?",
         (final_status, output, int(time.time()), video_id),
     )
-    db.commit()
+    await db.commit()
     if request.headers.get("HX-Request"):
-        return _render_card(video_id)
+        return await _render_card(video_id)
     return jsonify({"status": final_status, "exit_code": exit_code, "output": output})
 
 
 @app.post("/videos/<video_id>/hide")
 @auth_required
-def hide_video(video_id: str):
-    db = get_db()
-    db.execute(
+async def hide_video(video_id: str):
+    db = await get_db()
+    await db.execute(
         "UPDATE videos SET status = 'hidden', status_changed_at = ? WHERE video_id = ?",
         (int(time.time()), video_id),
     )
-    db.commit()
+    await db.commit()
     if request.headers.get("HX-Request"):
         return ("", 200)
     return jsonify({"ok": True})
@@ -1675,13 +1714,13 @@ def hide_video(video_id: str):
 
 @app.post("/videos/<video_id>/watched")
 @auth_required
-def watched_video(video_id: str):
-    db = get_db()
-    db.execute(
+async def watched_video(video_id: str):
+    db = await get_db()
+    await db.execute(
         "UPDATE videos SET status = 'watched', status_changed_at = ? WHERE video_id = ?",
         (int(time.time()), video_id),
     )
-    db.commit()
+    await db.commit()
     if request.headers.get("HX-Request"):
         return ("", 200)
     return jsonify({"ok": True})
@@ -1689,27 +1728,24 @@ def watched_video(video_id: str):
 
 @app.post("/channels/<channel_name>/mark-watched")
 @auth_required
-def mark_channel_watched(channel_name: str):
-    """Bulk-flip every actionable video in the channel to 'watched'.
-    Mirrors the auto_watched_days sweep but scoped + manual."""
-    db = get_db()
-    if not db.execute("SELECT 1 FROM channels WHERE name = ?", (channel_name,)).fetchone():
+async def mark_channel_watched(channel_name: str):
+    """Bulk-flip every actionable video in the channel to 'watched'."""
+    db = await get_db()
+    if not await db.execute("SELECT 1 FROM channels WHERE name = ?", (channel_name,)).fetchone():
         return ("channel not found", 404)
     now = int(time.time())
-    cur = db.execute(
+    cur = await db.execute(
         """UPDATE videos
               SET status = 'watched', status_changed_at = ?
             WHERE channel_name = ?
               AND status IN ('new', 'failed')""",
         (now, channel_name),
     )
-    db.commit()
+    await db.commit()
     marked = cur.rowcount or 0
     if request.headers.get("HX-Request"):
-        resp = board_partial()
-        if isinstance(resp, str):
-            from flask import make_response
-            resp = make_response(resp)
+        body = await board_partial()
+        resp = await make_response(body)
         resp.headers["HX-Trigger"] = json.dumps({
             "wytchr:channel-watched": {"channel": channel_name, "marked": marked}
         })
@@ -1719,40 +1755,36 @@ def mark_channel_watched(channel_name: str):
 
 @app.post("/videos/<video_id>/unhide")
 @auth_required
-def unhide_video(video_id: str):
-    db = get_db()
-    db.execute(
+async def unhide_video(video_id: str):
+    db = await get_db()
+    await db.execute(
         "UPDATE videos SET status = 'new', status_changed_at = ? WHERE video_id = ?",
         (int(time.time()), video_id),
     )
-    db.commit()
+    await db.commit()
     if request.headers.get("HX-Request"):
-        return _render_card(video_id)
+        return await _render_card(video_id)
     return jsonify({"ok": True})
 
 
-def _render_card(video_id: str):
-    db = get_db()
-    row = db.execute(
+async def _render_card(video_id: str):
+    db = await get_db()
+    row = await db.execute(
         """SELECT video_id, title, duration, upload_date, thumbnail_url, url, status, channel_name, favorited_at, description
              FROM videos WHERE video_id = ?""",
         (video_id,),
     ).fetchone()
     if not row:
         return ("", 404)
-    return render_template("_card.html", v=row)
+    return await render_template("_card.html", v=row)
 
 
 # --- Favorites + webhooks --------------------------------------------
 
-def _video_payload(row: sqlite3.Row) -> dict:
-    # Receivers (e.g. all-my-favs) typically expect bookmark fields
-    # at the top level: url, title, notes. We map description→notes.
-    desc = None
-    try:
-        desc = row["description"]
-    except (IndexError, KeyError):
-        pass
+def _video_payload(row) -> dict:
+    # Receivers (e.g. all-my-favs) typically expect bookmark fields at
+    # the top level: url, title, notes. We map description→notes.
+    desc = row.get("description") if isinstance(row, dict) else None
     return {
         "id": row["video_id"],
         "title": row["title"],
@@ -1769,52 +1801,45 @@ def _video_payload(row: sqlite3.Row) -> dict:
 _VIDEO_ID_RE = re.compile(r"(?:v=|/shorts/|youtu\.be/)([A-Za-z0-9_-]{11})")
 
 
-def _enrich_and_fire_async(video_id: str) -> None:
-    """Bg: backfill description (if missing), then fire the favorite
-    webhook. Caller has already toggled favorited_at on."""
-    def run():
-        with standalone_db() as db:
-            row = db.execute(
-                """SELECT video_id, title, duration, upload_date, thumbnail_url,
-                          url, status, channel_name, favorited_at, description
-                     FROM videos WHERE video_id = ?""",
-                (video_id,),
-            ).fetchone()
-            if not row:
-                return
-            if not row["description"] and row["url"]:
-                desc = _fetch_description(row["url"])
-                if desc:
-                    db.execute(
-                        "UPDATE videos SET description = ? WHERE video_id = ?",
-                        (desc, video_id),
-                    )
-                    db.commit()
-                    row = db.execute(
-                        """SELECT video_id, title, duration, upload_date, thumbnail_url,
-                                  url, status, channel_name, favorited_at, description
-                             FROM videos WHERE video_id = ?""",
-                        (video_id,),
-                    ).fetchone()
-        _fire_webhooks_sync("video.favorited", _video_payload(row))
-    threading.Thread(target=run, daemon=True).start()
+async def _enrich_and_fire(video_id: str) -> None:
+    """Bg task: backfill description (if missing), then fire the
+    favorite webhook. Caller has already toggled favorited_at on and
+    spawned this via asyncio.create_task."""
+    async with standalone_db() as db:
+        row = await db.execute(
+            """SELECT video_id, title, duration, upload_date, thumbnail_url,
+                      url, status, channel_name, favorited_at, description
+                 FROM videos WHERE video_id = ?""",
+            (video_id,),
+        ).fetchone()
+        if not row:
+            return
+        if not row["description"] and row["url"]:
+            desc = await _fetch_description(row["url"])
+            if desc:
+                await db.execute(
+                    "UPDATE videos SET description = ? WHERE video_id = ?",
+                    (desc, video_id),
+                )
+                await db.commit()
+                row = await db.execute(
+                    """SELECT video_id, title, duration, upload_date, thumbnail_url,
+                              url, status, channel_name, favorited_at, description
+                         FROM videos WHERE video_id = ?""",
+                    (video_id,),
+                ).fetchone()
+    await _fire_webhooks("video.favorited", _video_payload(row))
 
 
-def _fetch_description(video_url: str) -> str | None:
-    """Pull a video's description via the YouTube Data API v3. Returns
-    None if no API key is set, the URL doesn't carry an 11-char id, or
-    the call fails — caller treats None as "skip" and stores NULL.
-
-    yt-dlp can't do this from the K6 IP without auth (bot-gate), and
-    the operator has rejected cookies. The Data API has a 10k-unit
-    daily free quota; videos.list?part=snippet is 1 unit per call."""
+async def _fetch_description(video_url: str) -> str | None:
+    """Pull a video's description via the YouTube Data API v3."""
     if not YOUTUBE_API_KEY:
         return None
     m = _VIDEO_ID_RE.search(video_url)
     if not m:
         return None
     try:
-        r = httpx.get(
+        r = await _client().get(
             "https://www.googleapis.com/youtube/v3/videos",
             params={"id": m.group(1), "part": "snippet", "key": YOUTUBE_API_KEY},
             timeout=10.0,
@@ -1830,17 +1855,18 @@ def _fetch_description(video_url: str) -> str | None:
         return None
 
 
-def _fire_webhooks_sync(event: str, payload: dict, hook_id: int | None = None) -> None:
-    """POST to webhooks synchronously. Caller is responsible for
-    running this off the request thread when latency matters."""
-    with standalone_db() as db:
+async def _fire_webhooks(event: str, payload: dict, hook_id: int | None = None) -> None:
+    """POST to webhooks. Designed to be spawned via asyncio.create_task
+    when fire-and-forget; await directly when the caller wants to know
+    the result landed (none of the call sites do, today)."""
+    async with standalone_db() as db:
         if hook_id is not None:
-            hooks = db.execute(
+            hooks = await db.execute(
                 "SELECT id, url, bearer_token FROM webhooks WHERE id = ?",
                 (hook_id,),
             ).fetchall()
         else:
-            hooks = db.execute(
+            hooks = await db.execute(
                 "SELECT id, url, bearer_token FROM webhooks WHERE event = ? AND enabled = 1",
                 (event,),
             ).fetchall()
@@ -1852,31 +1878,24 @@ def _fire_webhooks_sync(event: str, payload: dict, hook_id: int | None = None) -
         status: int | None = None
         err: str | None = None
         try:
-            r = httpx.post(h["url"], json=body, headers=headers, timeout=10.0)
+            r = await _client().post(h["url"], json=body, headers=headers, timeout=10.0)
             status = r.status_code
             if r.status_code >= 400:
                 err = (r.text or "")[:500]
         except Exception as e:
             err = str(e)[:500]
-        with standalone_db() as db:
-            db.execute(
+        async with standalone_db() as db:
+            await db.execute(
                 "UPDATE webhooks SET last_fired_at = ?, last_status = ?, last_error = ? WHERE id = ?",
                 (int(time.time()), status, err, h["id"]),
             )
 
 
-def _fire_webhooks_async(event: str, payload: dict, hook_id: int | None = None) -> None:
-    """Fire-and-forget wrapper around _fire_webhooks_sync."""
-    threading.Thread(
-        target=_fire_webhooks_sync, args=(event, payload, hook_id), daemon=True,
-    ).start()
-
-
 @app.post("/videos/<video_id>/favorite")
 @auth_required
-def favorite_video(video_id: str):
-    db = get_db()
-    row = db.execute(
+async def favorite_video(video_id: str):
+    db = await get_db()
+    row = await db.execute(
         """SELECT v.video_id, v.title, v.duration, v.upload_date, v.thumbnail_url,
                   v.url, v.status, v.channel_name, v.favorited_at, v.description
              FROM videos v WHERE v.video_id = ?""",
@@ -1886,29 +1905,27 @@ def favorite_video(video_id: str):
         return jsonify({"error": "video not found"}), 404
     now = int(time.time())
     if row["favorited_at"]:
-        db.execute("UPDATE videos SET favorited_at = NULL WHERE video_id = ?", (video_id,))
-        db.commit()
+        await db.execute("UPDATE videos SET favorited_at = NULL WHERE video_id = ?", (video_id,))
+        await db.commit()
         favorited = False
     else:
-        db.execute("UPDATE videos SET favorited_at = ? WHERE video_id = ?", (now, video_id))
-        db.commit()
+        await db.execute("UPDATE videos SET favorited_at = ? WHERE video_id = ?", (now, video_id))
+        await db.commit()
         favorited = True
-        # Backfill description (1 YouTube Data API unit) and fire the
-        # webhook in the same background thread so the UI returns
-        # immediately. Description has to land before the POST or the
-        # receiver gets notes=null.
-        _enrich_and_fire_async(video_id)
+        # Backfill description + fire the webhook as a background task
+        # so the UI returns immediately. Description has to land before
+        # the POST or the receiver gets notes=null.
+        asyncio.create_task(_enrich_and_fire(video_id))
     if request.headers.get("HX-Request"):
-        resp = _render_card(video_id)
-        if isinstance(resp, str):
-            from flask import make_response
-            resp = make_response(resp)
+        body = await _render_card(video_id)
+        resp = await make_response(body)
         title = (row["title"] or row["video_id"])[:80]
         webhook_count = 0
         if favorited:
-            webhook_count = db.execute(
+            count_row = await db.execute(
                 "SELECT COUNT(*) AS n FROM webhooks WHERE event = 'video.favorited' AND enabled = 1"
-            ).fetchone()["n"]
+            ).fetchone()
+            webhook_count = count_row["n"]
         resp.headers["HX-Trigger"] = json.dumps({
             "wytchr:favorited": {
                 "favorited": favorited,
@@ -1922,40 +1939,40 @@ def favorite_video(video_id: str):
 
 @app.post("/videos/<video_id>/fetch-description")
 @auth_required
-def fetch_video_description(video_id: str):
-    """On-demand description fetch. Synchronous so the operator gets
-    the updated card back in the same response."""
-    db = get_db()
-    row = db.execute(
+async def fetch_video_description(video_id: str):
+    """On-demand description fetch. Awaits the API call so the operator
+    gets the updated card back in the same response."""
+    db = await get_db()
+    row = await db.execute(
         "SELECT video_id, url FROM videos WHERE video_id = ?", (video_id,)
     ).fetchone()
     if not row:
         return jsonify({"error": "video not found"}), 404
-    desc = _fetch_description(row["url"]) if row["url"] else None
+    desc = await _fetch_description(row["url"]) if row["url"] else None
     if desc:
-        db.execute(
+        await db.execute(
             "UPDATE videos SET description = ? WHERE video_id = ?",
             (desc, video_id),
         )
-        db.commit()
+        await db.commit()
     if request.headers.get("HX-Request"):
-        return _render_card(video_id)
+        return await _render_card(video_id)
     return jsonify({"ok": bool(desc), "description": desc})
 
 
 @app.get("/favorites")
 @auth_required
-def favorites_page():
-    db = get_db()
-    videos = db.execute(
+async def favorites_page():
+    db = await get_db()
+    videos = await db.execute(
         """SELECT video_id, title, duration, upload_date, thumbnail_url, url,
                   status, channel_name, favorited_at
              FROM videos
             WHERE favorited_at IS NOT NULL
          ORDER BY favorited_at DESC""",
     ).fetchall()
-    video_tags_map = _video_tags_map(db, [v["video_id"] for v in videos])
-    return render_template(
+    video_tags_map = await _video_tags_map(db, [v["video_id"] for v in videos])
+    return await render_template(
         "favorites.html",
         videos=videos,
         video_tags_map=video_tags_map,
@@ -1964,62 +1981,63 @@ def favorites_page():
 
 @app.get("/webhooks")
 @auth_required
-def webhooks_admin():
-    db = get_db()
-    hooks = db.execute(
+async def webhooks_admin():
+    db = await get_db()
+    hooks = await db.execute(
         "SELECT id, name, url, event, enabled, bearer_token, created_at, last_fired_at, last_status, last_error FROM webhooks ORDER BY id"
     ).fetchall()
-    return render_template("webhooks.html", hooks=hooks)
+    return await render_template("webhooks.html", hooks=hooks)
 
 
 @app.post("/webhooks")
 @auth_required
-def webhooks_create():
-    name = (request.form.get("name") or "").strip()
-    url = (request.form.get("url") or "").strip()
-    event = (request.form.get("event") or "video.favorited").strip()
-    bearer = (request.form.get("bearer_token") or "").strip() or None
+async def webhooks_create():
+    f = await request.form
+    name = (f.get("name") or "").strip()
+    url = (f.get("url") or "").strip()
+    event = (f.get("event") or "video.favorited").strip()
+    bearer = (f.get("bearer_token") or "").strip() or None
     if not name or not url:
         return ("name and url are required", 400)
     if not (url.startswith("http://") or url.startswith("https://")):
         return ("url must be http(s)", 400)
-    db = get_db()
-    db.execute(
+    db = await get_db()
+    await db.execute(
         "INSERT INTO webhooks (name, url, event, bearer_token, created_at) VALUES (?, ?, ?, ?, ?)",
         (name, url, event, bearer, int(time.time())),
     )
-    db.commit()
+    await db.commit()
     return redirect("/webhooks")
 
 
 @app.post("/webhooks/<int:hook_id>/toggle")
 @auth_required
-def webhooks_toggle(hook_id: int):
-    db = get_db()
-    db.execute("UPDATE webhooks SET enabled = 1 - enabled WHERE id = ?", (hook_id,))
-    db.commit()
+async def webhooks_toggle(hook_id: int):
+    db = await get_db()
+    await db.execute("UPDATE webhooks SET enabled = 1 - enabled WHERE id = ?", (hook_id,))
+    await db.commit()
     return redirect("/webhooks")
 
 
 @app.post("/webhooks/<int:hook_id>/delete")
 @auth_required
-def webhooks_delete(hook_id: int):
-    db = get_db()
-    db.execute("DELETE FROM webhooks WHERE id = ?", (hook_id,))
-    db.commit()
+async def webhooks_delete(hook_id: int):
+    db = await get_db()
+    await db.execute("DELETE FROM webhooks WHERE id = ?", (hook_id,))
+    await db.commit()
     return redirect("/webhooks")
 
 
 @app.post("/webhooks/<int:hook_id>/test")
 @auth_required
-def webhooks_test(hook_id: int):
-    db = get_db()
-    row = db.execute(
+async def webhooks_test(hook_id: int):
+    db = await get_db()
+    row = await db.execute(
         "SELECT event FROM webhooks WHERE id = ?", (hook_id,)
     ).fetchone()
     if not row:
         return ("not found", 404)
-    _fire_webhooks_async(
+    asyncio.create_task(_fire_webhooks(
         row["event"],
         {
             "id": "test", "title": "wytchr test event",
@@ -2031,22 +2049,35 @@ def webhooks_test(hook_id: int):
             "test": True,
         },
         hook_id=hook_id,
-    )
+    ))
     return redirect("/webhooks")
 
 
 # --- Bootstrap --------------------------------------------------------
 
-def start_scheduler():
-    sched = BackgroundScheduler(timezone="UTC")
-    sched.add_job(poll_all, "interval", minutes=POLL_INTERVAL_MINUTES, next_run_time=None)
-    sched.start()
-    return sched
+@app.before_serving
+async def _startup():
+    global _http_client, _scheduler
+    _http_client = httpx.AsyncClient()
+    await init_db()
+    _scheduler = AsyncIOScheduler(timezone="UTC")
+    _scheduler.add_job(
+        poll_all, "interval", minutes=POLL_INTERVAL_MINUTES, next_run_time=None
+    )
+    _scheduler.start()
 
 
-init_db()
-_scheduler = start_scheduler()
+@app.after_serving
+async def _shutdown():
+    global _http_client, _scheduler
+    if _scheduler is not None:
+        _scheduler.shutdown(wait=False)
+        _scheduler = None
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
 
 
 if __name__ == "__main__":
+    # Dev only — production runs hypercorn from the Dockerfile CMD.
     app.run(host="0.0.0.0", port=int(os.environ.get("FLASK_RUN_PORT", 5000)))

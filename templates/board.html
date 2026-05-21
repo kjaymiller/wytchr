@@ -802,6 +802,54 @@
           setTimeout(close, 280);
         }, 2800);
       });
+      // Async poll lifecycle: /poll/all returns 204 immediately with
+      // `wytchr:polling-started`; we then poll /poll/status every 2s
+      // until running flips false, at which point we synthesize a
+      // `wytchr:polled` event from the latest summary. Keeps the
+      // event loop free and the page interactive while the 30+s
+      // sweep runs as an asyncio task in the background.
+      (function() {
+        const btn = document.querySelector('.refresh-btn');
+        let statusTimer = null;
+        let baselineSummaryId = null;
+        function setBusy(busy) {
+          if (!btn) return;
+          btn.classList.toggle('htmx-request', busy);
+          btn.disabled = busy;
+        }
+        function stop() {
+          if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+          setBusy(false);
+        }
+        async function tick() {
+          let res;
+          try { res = await fetch('/poll/status', { credentials: 'same-origin' }); }
+          catch (_e) { return; /* network blip — try again next tick */ }
+          if (!res.ok) { stop(); return; }
+          const s = await res.json();
+          if (s.running) return;
+          // Finished: dispatch only when we've seen a *new* summary
+          // since we started watching, so a stale completion from
+          // before this click doesn't fire a phantom toast.
+          if (baselineSummaryId !== null && s.summary_id > baselineSummaryId && s.summary) {
+            document.body.dispatchEvent(new CustomEvent('wytchr:polled', { detail: s.summary }));
+            stop();
+          } else if (baselineSummaryId === null) {
+            stop();
+          }
+        }
+        document.body.addEventListener('wytchr:polling-started', (e) => {
+          const d = e.detail || {};
+          baselineSummaryId = typeof d.summary_id === 'number' ? d.summary_id : 0;
+          setBusy(true);
+          if (statusTimer) clearInterval(statusTimer);
+          // First check fast (catches near-instant scheduler-already-done
+          // states), then settle into a 2s cadence.
+          setTimeout(tick, 400);
+          statusTimer = setInterval(tick, 2000);
+        });
+      })();
+
       document.body.addEventListener('wytchr:polled', (e) => {
         refreshBoard();
         const s = e.detail || {};
