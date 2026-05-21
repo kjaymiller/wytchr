@@ -34,7 +34,7 @@ from quart import (
     request,
 )
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 YTDL_SUB_API_URL = os.environ.get("YTDL_SUB_API_URL", "http://ytdl-sub-api:5000").rstrip("/")

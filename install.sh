@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # wytchr installer.
 #
-# Provisions Aiven for PostgreSQL via Terraform, then boots wytchr with the
-# resulting connection string injected straight into the container env. The
-# DATABASE_URL is NEVER written to .env or any file on disk by this script.
+# Provisions Aiven for PostgreSQL via Terraform (or OpenTofu — the script
+# auto-detects), then boots wytchr with the resulting connection string
+# injected straight into the container env. The DATABASE_URL is NEVER
+# written to .env or any file on disk by this script.
 #
 # Requires:
 #   1Password CLI signed in (`op whoami`) — token is fetched via `op read`
-#   terraform >= 1.5, docker, docker compose
+#   tofu >= 1.6 OR terraform >= 1.5 (prefers tofu; override via $TF_BIN)
+#   docker, docker compose
 #
-# NOTE: Terraform writes infra/terraform.tfstate locally. That state file
-# contains the DB password in plaintext. It is gitignored, but treat it like
-# a secret on this host.
+# NOTE: The IaC tool writes infra/terraform.tfstate locally (same filename
+# regardless of binary). That state file contains the DB password in
+# plaintext. It is gitignored, but treat it like a secret on this host.
 
 set -euo pipefail
 
@@ -66,7 +68,26 @@ esac
 # Override by exporting AIVEN_OP_REF before running.
 AIVEN_OP_REF="${AIVEN_OP_REF:-op://Private/Aiven Homelab API KEY/credential}"
 
-for bin in terraform docker op; do
+# Pick the IaC binary. Honor $TF_BIN if set, otherwise prefer `tofu`
+# (OpenTofu — Apache-2.0, drop-in compatible) and fall back to
+# `terraform`. Both consume the same main.tf, both write
+# terraform.tfstate.
+TF="${TF_BIN:-}"
+if [[ -z "$TF" ]]; then
+  if command -v tofu >/dev/null 2>&1; then
+    TF=tofu
+  elif command -v terraform >/dev/null 2>&1; then
+    TF=terraform
+  else
+    echo "error: neither 'tofu' nor 'terraform' found in PATH (set \$TF_BIN to override)." >&2
+    exit 1
+  fi
+elif ! command -v "$TF" >/dev/null 2>&1; then
+  echo "error: \$TF_BIN='$TF' not found in PATH." >&2
+  exit 1
+fi
+
+for bin in docker op; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     echo "error: '$bin' not found in PATH." >&2
     exit 1
@@ -94,19 +115,19 @@ fi
 # or shell history beyond this process tree.
 export TF_VAR_aiven_api_token="$AIVEN_API_TOKEN"
 
-log "==> terraform init"
-terraform -chdir="$INFRA_DIR" init -input=false >&3
+log "==> $TF init"
+"$TF" -chdir="$INFRA_DIR" init -input=false >&3
 
-log "==> terraform apply (provisioning Aiven for PostgreSQL in jay-miller/do-nyc)"
-terraform -chdir="$INFRA_DIR" apply -auto-approve -input=false >&3
+log "==> $TF apply (provisioning Aiven for PostgreSQL in jay-miller/do-nyc)"
+"$TF" -chdir="$INFRA_DIR" apply -auto-approve -input=false >&3
 
 # -raw avoids JSON quoting; capture into a shell var so it stays in memory
 # only. Do NOT echo it, do NOT write it to a file.
-DATABASE_URL="$(terraform -chdir="$INFRA_DIR" output -raw database_url)"
+DATABASE_URL="$("$TF" -chdir="$INFRA_DIR" output -raw database_url)"
 export DATABASE_URL
 
 if [[ -z "$DATABASE_URL" ]]; then
-  echo "error: terraform did not produce a database_url output." >&2
+  echo "error: $TF did not produce a database_url output." >&2
   exit 1
 fi
 
