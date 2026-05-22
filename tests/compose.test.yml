@@ -1,0 +1,43 @@
+name: wytchr-test
+
+services:
+  pg:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=wytchr
+      - POSTGRES_PASSWORD=wytchr
+      - POSTGRES_DB=wytchr
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wytchr"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  stub:
+    build:
+      context: .
+      dockerfile: Dockerfile.stub
+    environment:
+      - API_TOKEN=test-token
+    expose:
+      - "5000"
+
+  wytchr:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      pg:
+        condition: service_healthy
+      stub:
+        condition: service_started
+    environment:
+      - API_TOKEN=test-token
+      - YTDL_SUB_API_URL=http://stub:5000
+      - YTDL_SUB_API_TOKEN=test-token
+      - DATABASE_URL=postgresql://wytchr:wytchr@pg:5432/wytchr
+      - POLL_INTERVAL_MINUTES=60
+    ports:
+      - "5050:5000"
