@@ -24,6 +24,8 @@ import httpx
 import psycopg
 from psycopg.rows import dict_row
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+import youtube_client
 from quart import (
     Quart,
     g,
@@ -664,40 +666,29 @@ async def _flat_listing(url: str, limit: int) -> list[dict]:
     return await asyncio.to_thread(_flat_listing_sync, url, limit)
 
 
-def _resolve_channel_sync(url: str) -> dict:
+async def _resolve_channel(url: str) -> dict:
     """Resolve a video or channel URL to its channel.
 
-    Accepts the full menagerie of YouTube URL shapes: /watch?v=, youtu.be/,
-    /channel/, /@handle, /c/, /user/. Returns {channel_url, channel_name,
-    handle, title}. Raises RuntimeError on resolution failure.
+    Accepts the URL shapes supported by youtube_client.resolve_channel:
+    /watch?v=, youtu.be/, /channel/UC..., /@handle. Returns
+    {channel_url, channel_name, handle}. Raises RuntimeError on failure
+    so the caller's existing except-and-redirect path keeps working.
     """
-    cmd = [
-        "yt-dlp", "--no-warnings", "--skip-download", "--playlist-items", "1",
-        "--print", "%(channel_url)s\t%(uploader_id)s\t%(channel)s\t%(uploader_url)s",
-        url,
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    line = next((ln for ln in proc.stdout.splitlines() if ln.strip()), "")
-    if not line:
-        raise RuntimeError(proc.stderr.strip()[-500:] or "no metadata returned")
-    parts = (line.split("\t") + ["", "", "", ""])[:4]
-    channel_url, uploader_id, channel_name, uploader_url = (p.strip() for p in parts)
-    # Prefer the @handle URL when available — ytdl-sub-api / yt-dlp's
-    # subscription path resolves handles more reliably across renames
-    # than the underlying /channel/UCxxx ID.
-    canonical_url = uploader_url if uploader_url and uploader_url != "NA" else channel_url
-    if not canonical_url or canonical_url == "NA":
-        raise RuntimeError("could not resolve channel URL")
-    handle = uploader_id.lstrip("@") if uploader_id and uploader_id != "NA" else ""
+    if not YOUTUBE_API_KEY:
+        raise RuntimeError("YOUTUBE_API_KEY is not configured")
+    try:
+        resolved = await youtube_client.resolve_channel(
+            _client(), url, api_key=YOUTUBE_API_KEY
+        )
+    except (youtube_client.YouTubeAPIError, ValueError) as exc:
+        raise RuntimeError(str(exc)) from exc
+    handle = resolved.get("handle") or ""
+    title = resolved.get("title") or handle
     return {
-        "channel_url": canonical_url,
-        "channel_name": channel_name if channel_name and channel_name != "NA" else handle,
+        "channel_url": resolved["url"],
+        "channel_name": title,
         "handle": handle,
     }
-
-
-async def _resolve_channel(url: str) -> dict:
-    return await asyncio.to_thread(_resolve_channel_sync, url)
 
 
 def _best_thumbnail(entry: dict) -> str | None:
