@@ -104,7 +104,11 @@ CREATE TABLE IF NOT EXISTS videos (
   seen_at BIGINT NOT NULL,
   status_changed_at BIGINT NOT NULL,
   favorited_at BIGINT,
-  description TEXT
+  description TEXT,
+  -- Pivot step 3: watchlist/watched timestamps (BIGINT epoch seconds).
+  -- NULL on both = "not on watchlist, not watched".
+  watchlist_added_at BIGINT,
+  watched_at BIGINT
 );
 CREATE INDEX IF NOT EXISTS videos_channel_status ON videos(channel_name, status);
 CREATE INDEX IF NOT EXISTS videos_seen ON videos(seen_at DESC);
@@ -322,6 +326,20 @@ async def init_db() -> None:
         await db.execute(
             "ALTER TABLE channel_settings ADD COLUMN IF NOT EXISTS "
             "include_members_only INTEGER NOT NULL DEFAULT 0"
+        )
+        # Pivot step 3: watchlist + watched-state columns. Wired up by
+        # later steps (#10 poll loop, #12 auto-mark-watched). Additive
+        # only — existing rows are NULL on both columns, which reads as
+        # "not on watchlist, not watched".
+        await db.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS watchlist_added_at BIGINT")
+        await db.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS watched_at BIGINT")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS videos_watchlist ON videos(watchlist_added_at DESC) "
+            "WHERE watchlist_added_at IS NOT NULL"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS videos_channel_unwatched "
+            "ON videos(channel_name) WHERE watched_at IS NULL"
         )
 
 
