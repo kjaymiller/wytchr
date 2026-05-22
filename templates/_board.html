@@ -113,7 +113,7 @@
            hx-swap="innerHTML"
            hx-push-url="{% if show_hidden %}?hidden=1{% else %}/{% endif %}">clear filter</a>.
       {% else %}
-        No channels yet. Add one via <code>POST {{ '{' }} ytdl-sub-api {{ '}' }}/channels</code>.
+        No channels yet. <a href="/channels/add">Add one</a> from a YouTube video or channel URL.
       {% endif %}
     </p>
   {% endfor %}

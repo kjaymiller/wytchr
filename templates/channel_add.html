@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>wytchr · add channel</title>
+  <style>
+    :root { color-scheme: dark; }
+    body, body[data-theme="licorice"] { --bg:#0a060d; --card:#15101a; --line:#2d2238; --fg:#f3e9e6; --muted:#8a7d8a; --accent:#ff5f87; --accent-ink:#1a0a14; --danger:#f25b5b; --ok:#b8e0a3; }
+    body[data-theme="marmite"] { --bg:#14100a; --card:#221a10; --line:#3d2f1d; --fg:#f7e7a8; --muted:#a89568; --accent:#f5c518; --accent-ink:#1a1208; --danger:#d63d3d; --ok:#9bc053; }
+    body[data-theme="sees"] { --bg:#14100c; --card:#221a14; --line:#3d2e22; --fg:#f5ebe0; --muted:#a89578; --accent:#d4a574; --accent-ink:#14100c; --danger:#c84545; --ok:#9aae6a; }
+    body[data-theme="jaffa"] { --bg:#1c0e04; --card:#2c1808; --line:#4c3018; --fg:#f5d8a8; --muted:#a8835a; --accent:#f97316; --accent-ink:#1c0e04; --danger:#d63d3d; --ok:#a8be58; }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; }
+    header { display: flex; align-items: center; gap: 1.25rem; padding: .75rem 1rem; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; padding-right: .75rem; border-right: 1px solid var(--line); }
+    header a { color: var(--muted); text-decoration: none; font-size: .85rem; }
+    header a:hover { color: var(--accent); }
+    main { max-width: 44rem; padding: 1rem; margin: 0 auto; }
+    .hint { color: var(--muted); font-size: .8rem; margin: 0 0 1rem; }
+    .err { background: rgba(242, 91, 91, .12); border: 1px solid var(--danger); color: var(--danger); border-radius: 6px; padding: .5rem .75rem; margin-bottom: 1rem; font-size: .85rem; word-break: break-word; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: .85rem; }
+    form { display: grid; grid-template-columns: minmax(8rem, auto) 1fr; gap: .55rem .75rem; align-items: center; }
+    label { color: var(--muted); font-size: .8rem; }
+    .field-hint { grid-column: 2; color: var(--muted); font-size: .72rem; margin-top: -.3rem; }
+    input, select {
+      background: var(--bg); color: var(--fg);
+      border: 1px solid var(--line); border-radius: 4px;
+      padding: .35rem .55rem; font: inherit; font-size: .85rem; width: 100%;
+    }
+    input:focus, select:focus { outline: none; border-color: var(--accent); }
+    .submit { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: .5rem; }
+    button.primary {
+      background: var(--accent); color: var(--accent-ink); border: 1px solid var(--accent);
+      border-radius: 4px; padding: .35rem .9rem; font: inherit; font-weight: 600; cursor: pointer;
+    }
+    a.cancel { color: var(--muted); text-decoration: none; align-self: center; }
+    a.cancel:hover { color: var(--accent); }
+  </style>
+</head>
+<body data-theme="licorice">
+  <script>try { const t = localStorage.getItem('wytchr.theme'); if (t) document.body.setAttribute('data-theme', t); } catch (e) {}</script>
+  <header>
+    <h1>wytchr · add channel</h1>
+    <a href="/">← back to board</a>
+  </header>
+  <main>
+    <p class="hint">
+      Paste a YouTube video URL or a channel URL (any of <code>/watch?v=…</code>,
+      <code>youtu.be/…</code>, <code>/channel/UC…</code>, <code>/@handle</code>, <code>/c/…</code>, <code>/user/…</code>).
+      wytchr resolves it to the underlying channel via yt-dlp, registers it with
+      ytdl-sub-api under the chosen profile, then kicks a poll.
+    </p>
+    {% if error %}
+      <div class="err">{{ error }}</div>
+    {% endif %}
+    <div class="card">
+      <form method="post" action="/channels/add">
+        <label for="url">URL</label>
+        <input id="url" name="url" type="url" required autofocus
+               placeholder="https://www.youtube.com/@channel or https://youtu.be/…"
+               value="{{ prefill_url }}">
+
+        <label for="profile">profile</label>
+        <select id="profile" name="profile">
+          <option value="">(base preset only)</option>
+          {% for p in profiles %}
+            <option value="{{ p }}">{{ p }}</option>
+          {% endfor %}
+        </select>
+        <span class="field-hint">profile-driven defaults for date_range, max_files, etc.</span>
+
+        <label for="name">name <span style="color:var(--muted)">(optional)</span></label>
+        <input id="name" name="name" type="text"
+               placeholder="auto-derived from the channel handle">
+        <span class="field-hint">the upstream subscription id. Defaults to the channel's @handle.</span>
+
+        <div class="submit">
+          <a class="cancel" href="/">cancel</a>
+          <button class="primary" type="submit">add channel</button>
+        </div>
+      </form>
+    </div>
+  </main>
+</body>
+</html>

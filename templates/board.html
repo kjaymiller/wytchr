@@ -419,6 +419,33 @@
     }
     .tag-add input::placeholder { color: var(--muted); opacity: .65; }
     .tag-add input:focus { outline: none; }
+
+    #add-channel-form {
+      display: flex; gap: .5rem; align-items: center;
+      padding: .55rem .65rem; margin: 0 .25rem 1rem;
+      background: var(--card); border: 1px solid var(--line);
+      border-radius: 8px; flex-wrap: wrap;
+    }
+    #add-channel-form .add-label {
+      color: var(--accent); font-weight: 600; font-size: .85rem;
+      padding-right: .15rem; user-select: none;
+    }
+    #add-channel-form input, #add-channel-form select {
+      background: var(--bg); color: var(--fg);
+      border: 1px solid var(--line); border-radius: 4px;
+      padding: .35rem .55rem; font: inherit; font-size: .85rem;
+    }
+    #add-channel-form input:focus, #add-channel-form select:focus {
+      outline: none; border-color: var(--accent);
+    }
+    #add-channel-form input[type="url"] { flex: 1 1 22rem; min-width: 16rem; }
+    #add-channel-form input[name="name"] { flex: 0 1 11rem; min-width: 8rem; }
+    #add-channel-form select { flex: 0 0 auto; }
+    #add-channel-form button.primary {
+      background: var(--accent); color: var(--accent-ink); border: 1px solid var(--accent);
+      border-radius: 4px; padding: .35rem .9rem; font: inherit; font-weight: 600; cursor: pointer;
+    }
+    #add-channel-form button.primary:hover { background: #ff7a9e; border-color: #ff7a9e; }
   </style>
 </head>
 <body data-theme="licorice">
@@ -472,6 +499,22 @@
     </div>
   </header>
   <main>
+    <form id="add-channel-form" method="post" action="/channels/add" aria-label="add channel">
+      <label class="add-label" for="add-url">+ add</label>
+      <input id="add-url" name="url" type="url" required
+             placeholder="paste a YouTube video or channel URL"
+             autocomplete="off" spellcheck="false">
+      <select id="add-profile" name="profile" aria-label="profile">
+        <option value="">(base preset)</option>
+        {% for p in profiles %}
+          <option value="{{ p }}">{{ p }}</option>
+        {% endfor %}
+      </select>
+      <input id="add-name" name="name" type="text"
+             placeholder="name (optional)"
+             autocomplete="off" spellcheck="false">
+      <button type="submit" class="primary">add channel</button>
+    </form>
     <div id="board"
          hx-get="/board{{ ('?' ~ request.query_string.decode()) if request.query_string else '' }}"
          hx-trigger="load, every 30s [shouldAutoPoll()]"
@@ -990,7 +1033,7 @@
       return true;
     }
 
-    // "show hidden" toggle: build URL from current location so the
+// "show hidden" toggle: build URL from current location so the
     // active tag filter is preserved across toggles, then htmx-swap
     // #board and pushState the new URL.
     (function() {

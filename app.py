@@ -34,7 +34,7 @@ from quart import (
     request,
 )
 
-__version__ = "0.10.1"
+__version__ = "0.11.0"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 YTDL_SUB_API_URL = os.environ.get("YTDL_SUB_API_URL", "http://ytdl-sub-api:5000").rstrip("/")
@@ -656,6 +656,42 @@ async def _flat_listing(url: str, limit: int) -> list[dict]:
     return await asyncio.to_thread(_flat_listing_sync, url, limit)
 
 
+def _resolve_channel_sync(url: str) -> dict:
+    """Resolve a video or channel URL to its channel.
+
+    Accepts the full menagerie of YouTube URL shapes: /watch?v=, youtu.be/,
+    /channel/, /@handle, /c/, /user/. Returns {channel_url, channel_name,
+    handle, title}. Raises RuntimeError on resolution failure.
+    """
+    cmd = [
+        "yt-dlp", "--no-warnings", "--skip-download", "--playlist-items", "1",
+        "--print", "%(channel_url)s\t%(uploader_id)s\t%(channel)s\t%(uploader_url)s",
+        url,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    line = next((ln for ln in proc.stdout.splitlines() if ln.strip()), "")
+    if not line:
+        raise RuntimeError(proc.stderr.strip()[-500:] or "no metadata returned")
+    parts = (line.split("\t") + ["", "", "", ""])[:4]
+    channel_url, uploader_id, channel_name, uploader_url = (p.strip() for p in parts)
+    # Prefer the @handle URL when available — ytdl-sub-api / yt-dlp's
+    # subscription path resolves handles more reliably across renames
+    # than the underlying /channel/UCxxx ID.
+    canonical_url = uploader_url if uploader_url and uploader_url != "NA" else channel_url
+    if not canonical_url or canonical_url == "NA":
+        raise RuntimeError("could not resolve channel URL")
+    handle = uploader_id.lstrip("@") if uploader_id and uploader_id != "NA" else ""
+    return {
+        "channel_url": canonical_url,
+        "channel_name": channel_name if channel_name and channel_name != "NA" else handle,
+        "handle": handle,
+    }
+
+
+async def _resolve_channel(url: str) -> dict:
+    return await asyncio.to_thread(_resolve_channel_sync, url)
+
+
 def _best_thumbnail(entry: dict) -> str | None:
     """Pick a usable thumbnail URL from yt-dlp's flat-playlist entry."""
     thumbs = entry.get("thumbnails") or []
@@ -896,7 +932,13 @@ async def login_submit():
 @app.get("/")
 @auth_required
 async def index():
-    return await render_template("board.html", poll_interval=POLL_INTERVAL_MINUTES)
+    presets_data = await fetch_presets()
+    profiles = sorted((presets_data.get("profile_details") or {}).keys())
+    return await render_template(
+        "board.html",
+        poll_interval=POLL_INTERVAL_MINUTES,
+        profiles=profiles,
+    )
 
 
 @app.get("/board")
@@ -1251,6 +1293,86 @@ async def tags_admin():
         })
     flash = request.args.get("flash") or ""
     return await render_template("tags.html", grouped=grouped, flash=flash)
+
+
+@app.get("/channels/add")
+@auth_required
+async def channel_add_page():
+    presets_data = await fetch_presets()
+    profile_details = presets_data.get("profile_details") or {}
+    profiles = sorted(profile_details.keys())
+    return await render_template(
+        "channel_add.html",
+        profiles=profiles,
+        base_preset=presets_data.get("base_preset", ""),
+        error=request.args.get("error"),
+        prefill_url=request.args.get("url", ""),
+    )
+
+
+_NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _channel_id_from_url(url: str) -> str:
+    """Last path segment without an `@` prefix, slugified.
+
+    Used as the fallback ytdl-sub-api channel id when the operator
+    doesn't provide one and the resolver couldn't extract a handle.
+    """
+    tail = (url or "").rstrip("/").rsplit("/", 1)[-1]
+    return _NAME_RE.sub("-", tail.lstrip("@")).strip("-")
+
+
+@app.post("/channels/add")
+@auth_required
+async def channel_add():
+    f = await request.form
+    raw_url = (f.get("url") or "").strip()
+    override_name = (f.get("name") or "").strip()
+    profile = (f.get("profile") or "").strip()
+    if not raw_url:
+        return redirect("/channels/add?error=url+is+required")
+
+    try:
+        resolved = await _resolve_channel(raw_url)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)[:200].replace(" ", "+")
+        return redirect(f"/channels/add?error=could+not+resolve:+{msg}&url={raw_url}")
+
+    channel_url = resolved["channel_url"]
+    name = override_name or resolved["handle"] or _channel_id_from_url(channel_url)
+    name = _NAME_RE.sub("-", name).strip("-")
+    if not name:
+        return redirect(f"/channels/add?error=could+not+derive+a+name&url={raw_url}")
+
+    payload: dict = {"url": channel_url, "name": name}
+    if profile:
+        payload["profile"] = profile
+    try:
+        r = await _client().post(
+            f"{YTDL_SUB_API_URL}/channels",
+            headers=_api_headers(), json=payload, timeout=20,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return redirect(f"/channels/add?error=upstream+unreachable:+{exc}&url={raw_url}")
+    if r.status_code != 201:
+        try:
+            err = r.json().get("error", r.text[:200])
+        except Exception:  # noqa: BLE001
+            err = r.text[:200]
+        err = str(err)[:200].replace(" ", "+")
+        return redirect(f"/channels/add?error={err}&url={raw_url}")
+
+    # Mirror the upstream registry into our DB and kick a poll so the
+    # new channel shows up on the board without waiting for the next
+    # scheduler tick.
+    async with standalone_db() as db:
+        try:
+            await sync_channels_from_api(db)
+        except Exception:  # noqa: BLE001
+            pass
+    await _start_poll_async()
+    return redirect("/")
 
 
 @app.post("/channels/<channel_name>/profile")
