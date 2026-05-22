@@ -719,9 +719,9 @@
     })();
 
     // SortableJS: dragging a channel column between profile
-    // sections kicks off DELETE+POST against ytdl-sub-api via the
-    // wytchr orchestration route. Confirms before firing the
-    // re-subscribe so an accidental drag is recoverable.
+    // sections updates the channel's preset label via the wytchr
+    // orchestration route. Confirms before firing the reassign so an
+    // accidental drag is recoverable.
     function wireSortables() {
       document.querySelectorAll('.sortable-columns').forEach((el) => {
         if (el.__sortableWired) return;
