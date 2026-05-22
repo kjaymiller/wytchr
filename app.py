@@ -1,12 +1,13 @@
-"""wytchr — manual-download UI on top of ytdl-sub-api.
+"""wytchr — channel browser + watchlist UI on top of the YouTube Data API.
 
-Polls each channel registered with ytdl-sub-api, surfaces recent
-uploads in a per-channel column board, and posts a one-off download
-to ytdl-sub-api when the user clicks. PostgreSQL (Aiven) is the only
-state. Quart + asyncio: every route is async, DB is psycopg.AsyncConnection,
-HTTP calls are httpx.AsyncClient. The yt-dlp subprocess is the one
-intentionally-sync island — wrapped in asyncio.to_thread at the
-single call site.
+Polls each channel via YouTube Data API v3 (channels.list, playlistItems.list,
+videos.list), surfaces recent uploads in a per-channel column board, and
+maintains a per-video watchlist. PostgreSQL is the only state.
+
+Quart + asyncio throughout; all HTTP via httpx.AsyncClient.
+
+Mid-pivot: a few ytdl-sub-api click-to-download paths remain and will be
+removed in pivot step 5.
 """
 from __future__ import annotations
 
@@ -14,7 +15,6 @@ import asyncio
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -345,16 +345,6 @@ async def init_db() -> None:
 
 # --- Tags -------------------------------------------------------------
 
-# yt-dlp's --flat-playlist sets `availability` on entries that are
-# gated. We poll-skip these so they never enter the DB; the operator
-# can't act on them anyway and they'd just be visual noise.
-# `subscriber_only` is the channel-membership tier — split out so the
-# per-channel `include_members_only` toggle can opt back in for
-# channels where the operator is actually a member.
-MEMBERS_ONLY_AVAILABILITY = frozenset({"subscriber_only"})
-SKIP_AVAILABILITY = frozenset({"premium_only", "needs_auth"}) | MEMBERS_ONLY_AVAILABILITY
-
-
 _CHANNEL_SETTINGS_DEFAULTS = {
     "display_name": None,
     "date_range": None,
@@ -403,16 +393,6 @@ def _compile_title_re(pattern: str | None):
         return re.compile(pattern, re.IGNORECASE)
     except re.error:
         return None
-
-
-def _is_short(entry: dict) -> bool:
-    # yt-dlp flat-playlist puts shorts under a `/shorts/<id>` URL. The
-    # ie_key is "Youtube" for both, so the URL is the cleanest signal.
-    for key in ("url", "webpage_url", "original_url"):
-        u = entry.get(key)
-        if isinstance(u, str) and "/shorts/" in u:
-            return True
-    return False
 
 
 _TAG_RE = re.compile(r"[^a-z0-9_-]+")
@@ -644,44 +624,47 @@ async def request_download(url: str, preset: str) -> tuple[int, str]:
 
 # --- Polling ----------------------------------------------------------
 
-def _flat_listing_sync(url: str, limit: int) -> list[dict]:
-    """yt-dlp --flat-playlist --dump-json. One video JSON per line.
+_CHANNEL_URL_ID_RE = re.compile(r"youtube\.com/channel/(UC[\w-]{22})", re.I)
 
-    Stays synchronous on purpose — the user's call: every other I/O
-    path is asyncio-native, but spawning yt-dlp is a thread-pool job
-    via asyncio.to_thread. Reasons: yt-dlp's async story is third-party
-    and immature; subprocess.run is rock-solid and the throttling
-    config already lives in the yt-dlp extractor args.
+
+async def _resolve_channel_id_for_poll(db: AsyncPgConn, name: str, url: str) -> str:
+    """Return the UC... channel ID for a stored channel row.
+
+    Fast path: extract from /channel/UC... URLs (the canonical shape
+    new entries are stored in). Slow path: resolve via YouTube API
+    once and update channels.url to the canonical form so subsequent
+    polls take the fast path.
     """
-    cmd = [
-        "yt-dlp",
-        "--flat-playlist",
-        "--dump-json",
-        "--ignore-errors",
-        # `youtubetab:approximate_date` makes the channel-tab extractor
-        # surface relative dates ("2 weeks ago") as a `timestamp` field
-        # on flat-playlist entries.
-        "--extractor-args", "youtubetab:approximate_date",
-        "-I", f":{limit}",
-        url,
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    out: list[dict] = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    if not out and proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip()[-500:] or f"yt-dlp exit {proc.returncode}")
-    return out
+    m = _CHANNEL_URL_ID_RE.search(url or "")
+    if m:
+        return m.group(1)
+    resolved = await youtube_client.resolve_channel(
+        _client(), url, api_key=YOUTUBE_API_KEY
+    )
+    canonical = resolved["url"]
+    await db.execute(
+        "UPDATE channels SET url = ? WHERE name = ?", (canonical, name)
+    )
+    return resolved["channel_id"]
 
 
-async def _flat_listing(url: str, limit: int) -> list[dict]:
-    return await asyncio.to_thread(_flat_listing_sync, url, limit)
+def _isoduration_seconds(iso: str | None) -> int | None:
+    """Parse ISO 8601 duration (PT1H2M3S) to seconds. Returns None if
+    missing/unparseable. Only handles the H/M/S subset YouTube emits."""
+    if not iso:
+        return None
+    m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso)
+    if not m:
+        return None
+    h, mi, s = (int(g) if g else 0 for g in m.groups())
+    return h * 3600 + mi * 60 + s
+
+
+def _ymd_from_iso(iso: str | None) -> str | None:
+    """publishedAt (`2026-05-22T14:00:00Z`) → upload_date `YYYYMMDD`."""
+    if not iso or len(iso) < 10:
+        return None
+    return iso[:4] + iso[5:7] + iso[8:10]
 
 
 async def _resolve_channel(url: str) -> dict:
@@ -709,62 +692,77 @@ async def _resolve_channel(url: str) -> dict:
     }
 
 
-def _best_thumbnail(entry: dict) -> str | None:
-    """Pick a usable thumbnail URL from yt-dlp's flat-playlist entry."""
-    thumbs = entry.get("thumbnails") or []
-    if isinstance(thumbs, list) and thumbs:
-        return thumbs[-1].get("url")
-    if entry.get("thumbnail"):
-        return entry["thumbnail"]
-    vid = entry.get("id")
-    if vid:
-        return f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
-    return None
-
-
 async def poll_channel(db: AsyncPgConn, name: str, url: str) -> tuple[int, str | None]:
-    """Returns (new_video_count, error_message)."""
+    """Returns (new_video_count, error_message).
+
+    Hits the YouTube Data API for channel uploads + per-video details
+    (duration). No subprocess, no ytdl-sub-api involvement.
+    """
     now = int(time.time())
+    if not YOUTUBE_API_KEY:
+        msg = "YOUTUBE_API_KEY is not configured"
+        await db.execute(
+            "UPDATE channels SET last_polled_at = ?, last_error = ? WHERE name = ?",
+            (now, msg, name),
+        )
+        return 0, msg
     try:
-        entries = await _flat_listing(url, POLL_LIMIT)
+        channel_id = await _resolve_channel_id_for_poll(db, name, url)
+        uploads = await youtube_client.list_channel_uploads(
+            _client(), channel_id, api_key=YOUTUBE_API_KEY, limit=POLL_LIMIT
+        )
     except Exception as exc:  # noqa: BLE001
         await db.execute(
             "UPDATE channels SET last_polled_at = ?, last_error = ? WHERE name = ?",
             (now, str(exc)[:500], name),
         )
         return 0, str(exc)
-    # Per-channel opt-in for members-only ingest.
+
+    if not uploads:
+        await db.execute(
+            "UPDATE channels SET last_polled_at = ?, last_error = NULL WHERE name = ?",
+            (now, name),
+        )
+        return 0, None
+
+    # Pull duration (+ richer snippet) in a single batch call. ISO 8601
+    # `PT1H2M3S` shapes are parsed to seconds. Up to 50 IDs per call.
+    video_ids = [u["video_id"] for u in uploads if u.get("video_id")]
+    try:
+        details = await youtube_client.get_videos(
+            _client(), video_ids, api_key=YOUTUBE_API_KEY
+        )
+    except Exception:  # noqa: BLE001
+        details = []
+    detail_by_id = {d["id"]: d for d in details if d.get("id")}
+
     row = await db.execute(
-        "SELECT include_members_only FROM channel_settings WHERE channel_name = ?",
+        "SELECT include_shorts FROM channel_settings WHERE channel_name = ?",
         (name,),
     ).fetchone()
-    include_members_only = bool(row and row["include_members_only"])
+    include_shorts = bool(row and row["include_shorts"])
+
     new_count = 0
-    for e in entries:
-        vid = e.get("id")
+    for u in uploads:
+        vid = u.get("video_id")
         if not vid:
             continue
-        avail = e.get("availability")
-        if avail in MEMBERS_ONLY_AVAILABILITY:
-            if not include_members_only:
-                continue
-        elif avail in SKIP_AVAILABILITY:
+        detail = detail_by_id.get(vid) or {}
+        duration_iso = ((detail.get("contentDetails") or {}).get("duration"))
+        duration = _isoduration_seconds(duration_iso)
+        # Proxy for shorts: <=60s. YouTube API doesn't surface the
+        # /shorts/ URL the way yt-dlp's flat-playlist did. Imperfect
+        # (some non-short videos are also <=60s), but matches the
+        # operator's intent of skipping bite-sized content by default.
+        if duration is not None and duration <= 60 and not include_shorts:
             continue
-        if _is_short(e):
-            continue
+        title = u.get("title")
+        upload_date = _ymd_from_iso(u.get("published_at"))
+        thumb = u.get("thumbnail_url") or f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
+        watch_url = f"https://www.youtube.com/watch?v={vid}"
         existing = await db.execute(
             "SELECT status FROM videos WHERE video_id = ?", (vid,)
         ).fetchone()
-        title = e.get("title")
-        duration = int(e["duration"]) if isinstance(e.get("duration"), (int, float)) else None
-        upload_date = e.get("upload_date")
-        if not upload_date:
-            ts = e.get("timestamp")
-            if isinstance(ts, (int, float)) and ts > 0:
-                from datetime import datetime, timezone
-                upload_date = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y%m%d")
-        thumb = _best_thumbnail(e)
-        watch_url = e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
         if existing is None:
             await db.execute(
                 """INSERT INTO videos
