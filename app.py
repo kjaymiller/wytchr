@@ -1519,9 +1519,11 @@ async def hide_video(video_id: str):
 @auth_required
 async def watched_video(video_id: str):
     db = await get_db()
+    now = int(time.time())
     await db.execute(
-        "UPDATE videos SET status = 'watched', status_changed_at = ? WHERE video_id = ?",
-        (int(time.time()), video_id),
+        "UPDATE videos SET status = 'watched', status_changed_at = ?, "
+        "watched_at = COALESCE(watched_at, ?) WHERE video_id = ?",
+        (now, now, video_id),
     )
     await db.commit()
     if request.headers.get("HX-Request"):
@@ -1539,10 +1541,11 @@ async def mark_channel_watched(channel_name: str):
     now = int(time.time())
     cur = await db.execute(
         """UPDATE videos
-              SET status = 'watched', status_changed_at = ?
+              SET status = 'watched', status_changed_at = ?,
+                  watched_at = COALESCE(watched_at, ?)
             WHERE channel_name = ?
               AND status IN ('new', 'failed')""",
-        (now, channel_name),
+        (now, now, channel_name),
     )
     await db.commit()
     marked = cur.rowcount or 0
@@ -1858,6 +1861,46 @@ async def webhooks_test(hook_id: int):
 
 # --- Bootstrap --------------------------------------------------------
 
+async def auto_mark_watched() -> dict:
+    """Per-channel auto-mark-watched sweep.
+
+    Reads channel_settings.auto_watched_days as the per-channel window
+    (NULL = never auto-watch). For each channel with a window set, any
+    video whose seen_at predates now − window AND has watched_at IS NULL
+    AND status is in ('new', 'failed') flips to status='watched',
+    watched_at=now(). Manual marks aren't overwritten — they already
+    have watched_at populated.
+    """
+    summary: dict = {"channels": 0, "marked": 0}
+    now = int(time.time())
+    async with standalone_db() as db:
+        rows = await db.execute(
+            """SELECT channel_name, auto_watched_days
+                 FROM channel_settings
+                WHERE auto_watched_days IS NOT NULL AND auto_watched_days > 0"""
+        ).fetchall()
+        for r in rows:
+            cutoff = now - (int(r["auto_watched_days"]) * 86400)
+            cur = await db.execute(
+                """UPDATE videos
+                      SET status = 'watched',
+                          status_changed_at = ?,
+                          watched_at = ?
+                    WHERE channel_name = ?
+                      AND watched_at IS NULL
+                      AND status IN ('new', 'failed')
+                      AND seen_at < ?""",
+                (now, now, r["channel_name"], cutoff),
+            )
+            marked = cur.rowcount or 0
+            summary["channels"] += 1
+            summary["marked"] += marked
+        await db.commit()
+    if summary["marked"]:
+        print(f"auto_mark_watched: {summary}", file=sys.stderr, flush=True)
+    return summary
+
+
 @app.before_serving
 async def _startup():
     global _http_client, _scheduler
@@ -1866,6 +1909,9 @@ async def _startup():
     _scheduler = AsyncIOScheduler(timezone="UTC")
     _scheduler.add_job(
         poll_all, "interval", minutes=POLL_INTERVAL_MINUTES, next_run_time=None
+    )
+    _scheduler.add_job(
+        auto_mark_watched, "interval", hours=1, next_run_time=None
     )
     _scheduler.start()
 
