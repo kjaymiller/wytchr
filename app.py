@@ -39,9 +39,10 @@ __version__ = "0.11.0"
 API_TOKEN = os.environ.get("API_TOKEN", "")
 YTDL_SUB_API_URL = os.environ.get("YTDL_SUB_API_URL", "http://ytdl-sub-api:5000").rstrip("/")
 YTDL_SUB_API_TOKEN = os.environ.get("YTDL_SUB_API_TOKEN", API_TOKEN)
-# YouTube Data API v3 key for fetching video descriptions. Optional —
-# when unset, description-related fields stay NULL but everything else
-# works. The flat-playlist polling path doesn't depend on it.
+# YouTube Data API v3 key. Currently optional (fetches video
+# descriptions for webhook payloads). Becomes REQUIRED once the upcoming
+# pivot lands — wytchr is moving channel resolution and upload polling
+# off ytdl-sub-api onto the YouTube Data API.
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "30"))
@@ -55,6 +56,13 @@ if not API_TOKEN:
 if not DATABASE_URL:
     print("FATAL: DATABASE_URL env var must be set (Postgres URI from install.sh)", file=sys.stderr)
     sys.exit(1)
+
+if not YOUTUBE_API_KEY:
+    print(
+        "WARNING: YOUTUBE_API_KEY is unset. Description enrichment is disabled, and "
+        "future versions will require this key for channel resolution and upload polling.",
+        file=sys.stderr,
+    )
 
 app = Quart(__name__)
 
