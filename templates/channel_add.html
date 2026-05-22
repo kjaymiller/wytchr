@@ -48,9 +48,8 @@
   <main>
     <p class="hint">
       Paste a YouTube video URL or a channel URL (any of <code>/watch?v=…</code>,
-      <code>youtu.be/…</code>, <code>/channel/UC…</code>, <code>/@handle</code>, <code>/c/…</code>, <code>/user/…</code>).
-      wytchr resolves it to the underlying channel via yt-dlp, registers it with
-      ytdl-sub-api under the chosen profile, then kicks a poll.
+      <code>youtu.be/…</code>, <code>/channel/UC…</code>, <code>/@handle</code>).
+      wytchr resolves it via the YouTube Data API, stores it locally, then kicks a poll.
     </p>
     {% if error %}
       <div class="err">{{ error }}</div>

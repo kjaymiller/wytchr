@@ -1,6 +1,0 @@
-FROM python:3.13-slim
-RUN pip install --no-cache-dir "quart==0.20.*" "hypercorn==0.17.*"
-WORKDIR /app
-COPY stub_ytdl_api.py /app/stub_ytdl_api.py
-EXPOSE 5000
-CMD ["hypercorn", "stub_ytdl_api:app", "--bind", "0.0.0.0:5000"]

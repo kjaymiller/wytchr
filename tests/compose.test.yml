@@ -15,15 +15,6 @@ services:
       timeout: 3s
       retries: 30
 
-  stub:
-    build:
-      context: .
-      dockerfile: Dockerfile.stub
-    environment:
-      - API_TOKEN=test-token
-    expose:
-      - "5000"
-
   wytchr:
     build:
       context: ..
@@ -31,12 +22,11 @@ services:
     depends_on:
       pg:
         condition: service_healthy
-      stub:
-        condition: service_started
     environment:
       - API_TOKEN=test-token
-      - YTDL_SUB_API_URL=http://stub:5000
-      - YTDL_SUB_API_TOKEN=test-token
+      # Placeholder — outbound YouTube API calls won't succeed in tests
+      # without a real key. Boot / DB / form rendering still exercise.
+      - YOUTUBE_API_KEY=${YOUTUBE_API_KEY:-fake-test-key}
       - DATABASE_URL=postgresql://wytchr:wytchr@pg:5432/wytchr
       - POLL_INTERVAL_MINUTES=60
     ports:

@@ -46,29 +46,18 @@
   {% endwith %}
   <div class="actions">
     {% if v.status == 'new' or v.status == 'failed' %}
-      <button class="icon-btn dl"
-              hx-post="/videos/{{ v.video_id }}/download"
-              hx-target="#card-{{ v.video_id }}"
-              hx-swap="outerHTML"
-              hx-disabled-elt="this"
-              hx-confirm="{% if v.status == 'failed' %}Retry download?{% else %}{% endif %}"
-              title="{% if v.status == 'failed' %}retry download{% else %}download{% endif %}">↓</button>
+      <a class="icon-btn" href="https://www.youtube.com/watch?v={{ v.video_id }}"
+         target="_blank" rel="noopener" title="open on YouTube">▶</a>
       <button class="icon-btn"
               hx-post="/videos/{{ v.video_id }}/watched"
               hx-target="#card-{{ v.video_id }}"
               hx-swap="outerHTML"
-              title="mark as watched on YouTube">watched</button>
+              title="mark as watched">watched</button>
       <button class="icon-btn"
               hx-post="/videos/{{ v.video_id }}/hide"
               hx-target="#card-{{ v.video_id }}"
               hx-swap="outerHTML"
               title="hide">hide</button>
-    {% elif v.status == 'queued' or v.status == 'downloading' %}
-      <button disabled>downloading…</button>
-    {% elif v.status == 'done' %}
-      <button hx-post="/videos/{{ v.video_id }}/hide"
-              hx-target="#card-{{ v.video_id }}"
-              hx-swap="outerHTML">dismiss</button>
     {% elif v.status == 'hidden' %}
       <button hx-post="/videos/{{ v.video_id }}/unhide"
               hx-target="#card-{{ v.video_id }}"

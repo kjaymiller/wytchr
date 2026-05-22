@@ -10,7 +10,7 @@ services:
       # Provided by install.sh via process env (Aiven PG). Not in .env on
       # purpose — see install.sh. The app fails fast if unset.
       - DATABASE_URL=${DATABASE_URL:?DATABASE_URL required — run ./install.sh}
-      - YTDL_SUB_API_URL=${YTDL_SUB_API_URL:-http://ytdl-sub-api:5000}
+      - YOUTUBE_API_KEY=${YOUTUBE_API_KEY:?YOUTUBE_API_KEY required}
       - POLL_INTERVAL_MINUTES=${POLL_INTERVAL_MINUTES:-30}
       - POLL_LIMIT=${POLL_LIMIT:-30}
     ports:

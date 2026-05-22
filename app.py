@@ -6,8 +6,9 @@ maintains a per-video watchlist. PostgreSQL is the only state.
 
 Quart + asyncio throughout; all HTTP via httpx.AsyncClient.
 
-Mid-pivot: a few ytdl-sub-api click-to-download paths remain and will be
-removed in pivot step 5.
+Mid-pivot: the channels.preset column and profile UI carry over from the
+ytdl-sub-api era and get repurposed in step 6 to mean "auto-watched
+window."
 """
 from __future__ import annotations
 
@@ -39,17 +40,12 @@ from quart import (
 __version__ = "0.11.0"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
-YTDL_SUB_API_URL = os.environ.get("YTDL_SUB_API_URL", "http://ytdl-sub-api:5000").rstrip("/")
-YTDL_SUB_API_TOKEN = os.environ.get("YTDL_SUB_API_TOKEN", API_TOKEN)
-# YouTube Data API v3 key. Currently optional (fetches video
-# descriptions for webhook payloads). Becomes REQUIRED once the upcoming
-# pivot lands — wytchr is moving channel resolution and upload polling
-# off ytdl-sub-api onto the YouTube Data API.
+# YouTube Data API v3 key. Required — drives channel resolution, the
+# poll loop, and description enrichment.
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "30"))
 POLL_LIMIT = int(os.environ.get("POLL_LIMIT", "30"))
-DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "1800"))
 
 if not API_TOKEN:
     print("FATAL: API_TOKEN env var must be set", file=sys.stderr)
@@ -61,10 +57,10 @@ if not DATABASE_URL:
 
 if not YOUTUBE_API_KEY:
     print(
-        "WARNING: YOUTUBE_API_KEY is unset. Description enrichment is disabled, and "
-        "future versions will require this key for channel resolution and upload polling.",
+        "FATAL: YOUTUBE_API_KEY env var must be set (YouTube Data API v3 key)",
         file=sys.stderr,
     )
+    sys.exit(1)
 
 app = Quart(__name__)
 
@@ -497,11 +493,7 @@ def auth_required(fn):
     return wrapper
 
 
-# --- ytdl-sub-api client ---------------------------------------------
-
-def _api_headers() -> dict:
-    return {"Authorization": f"Bearer {YTDL_SUB_API_TOKEN}"}
-
+# --- HTTP client ------------------------------------------------------
 
 def _client() -> httpx.AsyncClient:
     """Return the process-wide AsyncClient. before_serving must have run."""
@@ -513,38 +505,22 @@ def _client() -> httpx.AsyncClient:
     return _http_client
 
 
-async def fetch_channels_from_api() -> list[dict]:
-    """Pull current channel registry from ytdl-sub-api."""
-    r = await _client().get(
-        f"{YTDL_SUB_API_URL}/channels", headers=_api_headers(), timeout=15
-    )
-    r.raise_for_status()
-    return r.json().get("channels", [])
+# Profile machinery — currently stubbed. The channels.preset column and
+# the per-channel "profile" UI are repurposed in pivot step 6 to drive
+# the auto-mark-watched window. Until then, callers get an empty profile
+# catalog so dropdowns render with no options instead of crashing.
+async def fetch_presets(force: bool = False) -> dict:  # noqa: ARG001
+    return {"profiles": [], "profile_details": {}, "base_preset": ""}
 
 
-# Profile cache. /presets is read on every /board fetch (sub-second
-# response, but the network round-trip adds up at the 30s auto-poll
-# cadence). 60s TTL is good enough — when the operator edits a profile
-# via the admin page, the page itself force-refreshes.
-_PRESETS_CACHE: dict = {"data": None, "fetched_at": 0.0}
-_PRESETS_TTL = 60.0
+def _resolve_profile(preset_str: str | None, profile_details: dict) -> str | None:  # noqa: ARG001
+    return None
 
 
-async def fetch_presets(force: bool = False) -> dict:
-    now = time.time()
-    if not force and _PRESETS_CACHE["data"] is not None and (now - _PRESETS_CACHE["fetched_at"]) < _PRESETS_TTL:
-        return _PRESETS_CACHE["data"]
-    try:
-        r = await _client().get(
-            f"{YTDL_SUB_API_URL}/presets", headers=_api_headers(), timeout=10
-        )
-        r.raise_for_status()
-        data = r.json()
-    except Exception:  # noqa: BLE001
-        return _PRESETS_CACHE["data"] or {"profiles": [], "profile_details": {}}
-    _PRESETS_CACHE["data"] = data
-    _PRESETS_CACHE["fetched_at"] = now
-    return data
+def _channel_window(
+    preset_str: str | None, profile_details: dict  # noqa: ARG001
+) -> tuple[int | None, int | None]:
+    return None, None
 
 
 _DATE_RANGE_RE = re.compile(r"(\d+)\s*(day|week|month|year)s?", re.IGNORECASE)
@@ -552,74 +528,19 @@ _DATE_UNITS = {"day": 1, "week": 7, "month": 30, "year": 365}
 
 
 def _parse_date_range(s: str | None) -> int | None:
-    """ytdl-sub date_range like '7days' / '2weeks' / '6months' / '1year'.
-    Returns the count in days, or None if unparseable / empty."""
+    """Parse a date_range token like '7days' / '2weeks' / '6months' /
+    '1year' to a day count. Returns None if unparseable / empty.
+
+    Kept for the per-channel `date_range` override on
+    /channels/<name>/settings; step 6 rewires it to drive the
+    auto-mark-watched window.
+    """
     if not s:
         return None
     m = _DATE_RANGE_RE.match(str(s).strip())
     if not m:
         return None
     return int(m.group(1)) * _DATE_UNITS[m.group(2).lower()]
-
-
-def _resolve_profile(preset_str: str | None, profile_details: dict) -> str | None:
-    """Right-to-left scan of the chain for the first part that names a
-    user-defined profile."""
-    if not preset_str:
-        return None
-    parts = [p.strip() for p in preset_str.split("|") if p.strip()]
-    for part in reversed(parts):
-        if part in profile_details:
-            return part
-    return None
-
-
-def _channel_window(preset_str: str | None, profile_details: dict) -> tuple[int | None, int | None]:
-    """Resolve the channel's display window from its preset chain.
-
-    Right-to-left because the most-specific profile is at the tail and
-    should win over earlier ones. Returns (max_age_days, max_files);
-    either may be None if not set by any profile in the chain.
-    """
-    if not preset_str:
-        return None, None
-    parts = [p.strip() for p in preset_str.split("|") if p.strip()]
-    for part in reversed(parts):
-        profile = profile_details.get(part)
-        if not profile:
-            continue
-        overrides = profile.get("overrides") or {}
-        days = _parse_date_range(overrides.get("only_recent_date_range"))
-        max_files = overrides.get("only_recent_max_files")
-        try:
-            max_files = int(max_files) if max_files is not None else None
-        except (TypeError, ValueError):
-            max_files = None
-        if days is not None or max_files is not None:
-            return days, max_files
-    return None, None
-
-
-async def request_download(url: str, preset: str) -> tuple[int, str]:
-    """POST /videos to ytdl-sub-api. Returns (exit_code, output_tail)."""
-    try:
-        r = await _client().post(
-            f"{YTDL_SUB_API_URL}/videos",
-            json={"url": url, "preset": preset},
-            headers=_api_headers(),
-            timeout=DOWNLOAD_TIMEOUT,
-        )
-    except httpx.HTTPError as exc:
-        return -1, f"network error: {exc}"
-    if r.status_code == 404:
-        return -1, "ytdl-sub-api /videos endpoint not deployed yet (apply the upstream patch in RUNBOOKS/phase-4-9-wytchr.md)"
-    try:
-        body = r.json()
-    except ValueError:
-        return r.status_code, r.text[-2000:]
-    if r.status_code >= 400 and "error" in body:
-        return body.get("exit_code", r.status_code), body["error"]
-    return body.get("exit_code", r.status_code), (body.get("output_tail") or "")[-2000:]
 
 
 # --- Polling ----------------------------------------------------------
@@ -790,40 +711,6 @@ async def poll_channel(db: AsyncPgConn, name: str, url: str) -> tuple[int, str |
     return new_count, None
 
 
-async def sync_channels_from_api(db: AsyncPgConn) -> None:
-    """Mirror ytdl-sub-api's channel list into our local table."""
-    remote = await fetch_channels_from_api()
-    seen = set()
-    for c in remote:
-        name = c.get("name")
-        url = c.get("url")
-        # ytdl-sub-api returns `preset` as a string for Shape-1 (chained-
-        # preset block) channels, but as a list for Shape-2 (standalone
-        # subscription with inline preset chain). Coerce to a " | "-joined
-        # string — matches the chained-preset key format used by Shape-1
-        # entries.
-        raw_preset = c.get("preset")
-        if isinstance(raw_preset, list):
-            preset = " | ".join(str(p) for p in raw_preset)
-        else:
-            preset = raw_preset or ""
-        if not name or not url:
-            continue
-        seen.add(name)
-        await db.execute(
-            """INSERT INTO channels (name, url, preset)
-               VALUES (?, ?, ?)
-               ON CONFLICT(name) DO UPDATE SET url = excluded.url, preset = excluded.preset""",
-            (name, url, preset),
-        )
-    if seen:
-        placeholders = ",".join("?" * len(seen))
-        await db.execute(
-            f"DELETE FROM channels WHERE name NOT IN ({placeholders})",
-            tuple(seen),
-        )
-
-
 # Asyncio-native poll coordinator. `running` is the in-flight flag —
 # both the scheduler and the manual /poll/all route consult it so a
 # user clicking "refresh" mid-cycle doesn't kick a second concurrent
@@ -841,15 +728,11 @@ _poll_lock = asyncio.Lock()
 
 
 async def _poll_all_impl() -> dict:
-    """Sync channel list, then poll each channel. Caller owns the run-flag."""
+    """Poll each channel. Caller owns the run-flag."""
     started = time.time()
     summary: dict = {"channels": 0, "new_videos": 0, "errors": []}
     try:
         async with standalone_db() as db:
-            try:
-                await sync_channels_from_api(db)
-            except Exception as exc:  # noqa: BLE001
-                summary["errors"].append(f"sync: {exc}")
             rows = await db.execute("SELECT name, url FROM channels").fetchall()
             await db.commit()
             summary["channels"] = len(rows)
@@ -1329,11 +1212,8 @@ _NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
 
 
 def _channel_id_from_url(url: str) -> str:
-    """Last path segment without an `@` prefix, slugified.
-
-    Used as the fallback ytdl-sub-api channel id when the operator
-    doesn't provide one and the resolver couldn't extract a handle.
-    """
+    """Last path segment without an `@` prefix, slugified. Fallback
+    channel name when the resolver couldn't extract a handle."""
     tail = (url or "").rstrip("/").rsplit("/", 1)[-1]
     return _NAME_RE.sub("-", tail.lstrip("@")).strip("-")
 
@@ -1360,32 +1240,20 @@ async def channel_add():
     if not name:
         return redirect(f"/channels/add?error=could+not+derive+a+name&url={raw_url}")
 
-    payload: dict = {"url": channel_url, "name": name}
-    if profile:
-        payload["profile"] = profile
-    try:
-        r = await _client().post(
-            f"{YTDL_SUB_API_URL}/channels",
-            headers=_api_headers(), json=payload, timeout=20,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return redirect(f"/channels/add?error=upstream+unreachable:+{exc}&url={raw_url}")
-    if r.status_code != 201:
-        try:
-            err = r.json().get("error", r.text[:200])
-        except Exception:  # noqa: BLE001
-            err = r.text[:200]
-        err = str(err)[:200].replace(" ", "+")
-        return redirect(f"/channels/add?error={err}&url={raw_url}")
-
-    # Mirror the upstream registry into our DB and kick a poll so the
-    # new channel shows up on the board without waiting for the next
-    # scheduler tick.
+    # Write to the local channels table. The `profile` column gets
+    # repurposed in pivot step 6 (auto-mark-watched window); for now it
+    # round-trips the form value as a free-form label.
     async with standalone_db() as db:
-        try:
-            await sync_channels_from_api(db)
-        except Exception:  # noqa: BLE001
-            pass
+        existing = await db.execute(
+            "SELECT 1 FROM channels WHERE name = ?", (name,)
+        ).fetchone()
+        if existing:
+            return redirect(f"/channels/add?error=already+subscribed&url={raw_url}")
+        await db.execute(
+            "INSERT INTO channels (name, url, preset) VALUES (?, ?, ?)",
+            (name, channel_url, profile),
+        )
+        await db.commit()
     await _start_poll_async()
     return redirect("/")
 
@@ -1393,53 +1261,20 @@ async def channel_add():
 @app.post("/channels/<channel_name>/profile")
 @auth_required
 async def channel_change_profile(channel_name: str):
-    """Reassign a channel's profile (DELETE + POST upstream)."""
+    """Reassign a channel's profile label (local DB only)."""
     body = await request.get_json(silent=True) or {}
     new_profile = (body.get("profile") or "").strip()
     db = await get_db()
-    row = await db.execute(
-        "SELECT url FROM channels WHERE name = ?", (channel_name,)
-    ).fetchone()
-    if not row:
-        return jsonify({"error": "channel not found in wytchr DB"}), 404
-    url = row["url"]
-
-    try:
-        d = await _client().delete(
-            f"{YTDL_SUB_API_URL}/channels/{channel_name}",
-            headers=_api_headers(), timeout=15,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": f"delete: {exc}"}), 502
-    if d.status_code not in (200, 404):
-        return jsonify({"error": f"delete: {d.status_code} {d.text[:200]}"}), 502
-
-    payload: dict = {"url": url, "name": channel_name}
-    if new_profile:
-        payload["profile"] = new_profile
-    try:
-        p = await _client().post(
-            f"{YTDL_SUB_API_URL}/channels",
-            headers=_api_headers(), json=payload, timeout=15,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": f"post: {exc}", "stranded": True}), 502
-    if p.status_code != 201:
-        try:
-            err = p.json().get("error", p.text[:200])
-        except Exception:  # noqa: BLE001
-            err = p.text[:200]
-        return jsonify({"error": err, "stranded": True, "status": p.status_code}), 502
-
-    presets_data = await fetch_presets(force=True)
-    base = presets_data.get("base_preset", "")
-    new_preset = f"{base} | {new_profile}" if new_profile else base
+    if not await db.execute(
+        "SELECT 1 FROM channels WHERE name = ?", (channel_name,)
+    ).fetchone():
+        return jsonify({"error": "channel not found"}), 404
     await db.execute(
         "UPDATE channels SET preset = ? WHERE name = ?",
-        (new_preset, channel_name),
+        (new_profile, channel_name),
     )
     await db.commit()
-    return jsonify({"ok": True, "preset": new_preset})
+    return jsonify({"ok": True, "preset": new_profile})
 
 
 # --- Per-channel settings ---------------------------------------------
@@ -1564,144 +1399,6 @@ async def channel_settings_save(channel_name: str):
     return redirect(f"/channels/{channel_name}/settings?saved=1")
 
 
-# --- Presets admin (proxy to ytdl-sub-api) ----------------------------
-
-def _split_csv(s: str) -> list[str]:
-    return [p.strip() for p in (s or "").split(",") if p.strip()]
-
-
-@app.get("/presets")
-@auth_required
-async def presets_admin():
-    data = await fetch_presets(force=True)
-    profile_details = data.get("profile_details") or {}
-    base_preset = data.get("base_preset", "")
-    profiles = []
-    for name, body in sorted(profile_details.items()):
-        overrides = body.get("overrides") or {}
-        profiles.append({
-            "name": name,
-            "parents": body.get("parents") or [],
-            "overrides": overrides,
-            "date_range": overrides.get("only_recent_date_range") or "",
-            "max_files": overrides.get("only_recent_max_files"),
-            "extra": {k: v for k, v in overrides.items() if k not in ("only_recent_date_range", "only_recent_max_files")},
-        })
-    flash = request.args.get("flash") or ""
-    flash_kind = request.args.get("kind") or "ok"
-    return await render_template(
-        "presets.html",
-        profiles=profiles,
-        base_preset=base_preset,
-        flash=flash,
-        flash_kind=flash_kind,
-    )
-
-
-async def _overrides_from_form() -> dict:
-    """Reconstruct an overrides dict from the admin form."""
-    out: dict = {}
-    f = await request.form
-    date_range = (f.get("date_range") or "").strip()
-    if date_range:
-        out["only_recent_date_range"] = date_range
-    max_files_raw = (f.get("max_files") or "").strip()
-    if max_files_raw:
-        try:
-            out["only_recent_max_files"] = int(max_files_raw)
-        except ValueError:
-            pass
-    extra = f.get("extra") or ""
-    for line in extra.splitlines():
-        line = line.strip()
-        if not line or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        k = k.strip()
-        v = v.strip()
-        if not k:
-            continue
-        try:
-            out[k] = int(v)
-        except ValueError:
-            try:
-                out[k] = float(v)
-            except ValueError:
-                out[k] = v
-    return out
-
-
-@app.post("/presets/create")
-@auth_required
-async def presets_create():
-    f = await request.form
-    name = (f.get("name") or "").strip()
-    parents = _split_csv(f.get("parents") or "")
-    overrides = await _overrides_from_form()
-    payload = {"name": name, "parents": parents, "overrides": overrides}
-    try:
-        r = await _client().post(
-            f"{YTDL_SUB_API_URL}/presets",
-            headers=_api_headers(),
-            json=payload,
-            timeout=15,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return redirect(f"/presets?kind=err&flash=upstream+unreachable:+{exc}")
-    await fetch_presets(force=True)
-    if r.status_code == 201:
-        return redirect(f"/presets?flash=created+{name}")
-    body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-    return redirect(f"/presets?kind=err&flash={body.get('error', 'create+failed')}")
-
-
-@app.post("/presets/<name>/update")
-@auth_required
-async def presets_update(name: str):
-    f = await request.form
-    parents = _split_csv(f.get("parents") or "")
-    overrides = await _overrides_from_form()
-    payload = {"parents": parents, "overrides": overrides}
-    try:
-        r = await _client().patch(
-            f"{YTDL_SUB_API_URL}/presets/{name}",
-            headers=_api_headers(),
-            json=payload,
-            timeout=15,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return redirect(f"/presets?kind=err&flash=upstream+unreachable:+{exc}")
-    await fetch_presets(force=True)
-    if r.status_code == 200:
-        return redirect(f"/presets?flash=updated+{name}")
-    body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-    return redirect(f"/presets?kind=err&flash={body.get('error', 'update+failed')}")
-
-
-@app.post("/presets/<name>/delete")
-@auth_required
-async def presets_delete(name: str):
-    try:
-        r = await _client().delete(
-            f"{YTDL_SUB_API_URL}/presets/{name}",
-            headers=_api_headers(),
-            timeout=15,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return redirect(f"/presets?kind=err&flash=upstream+unreachable:+{exc}")
-    await fetch_presets(force=True)
-    if r.status_code == 200:
-        return redirect(f"/presets?flash=deleted+{name}")
-    if r.status_code == 409:
-        body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-        users = body.get("users") or []
-        names = [u.get("name", "?") for u in users[:5]]
-        more = "" if len(users) <= 5 else f"+{len(users)-5}+more"
-        return redirect(f"/presets?kind=err&flash={name}+in+use+by+" + "+".join(names) + more)
-    body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-    return redirect(f"/presets?kind=err&flash={body.get('error', 'delete+failed')}")
-
-
 @app.post("/tags/create")
 @auth_required
 async def create_tag():
@@ -1802,37 +1499,6 @@ async def poll_status_route():
             "summary": _poll_state["summary"],
         }
     return jsonify(payload)
-
-
-@app.post("/videos/<video_id>/download")
-@auth_required
-async def download_video(video_id: str):
-    db = await get_db()
-    row = await db.execute(
-        """SELECT v.url, v.channel_name, c.preset
-             FROM videos v
-             JOIN channels c ON c.name = v.channel_name
-            WHERE v.video_id = ?""",
-        (video_id,),
-    ).fetchone()
-    if not row:
-        return jsonify({"error": "video not found"}), 404
-    now = int(time.time())
-    await db.execute(
-        "UPDATE videos SET status = 'queued', status_changed_at = ? WHERE video_id = ?",
-        (now, video_id),
-    )
-    await db.commit()
-    exit_code, output = await request_download(row["url"], row["preset"])
-    final_status = "done" if exit_code == 0 else "failed"
-    await db.execute(
-        "UPDATE videos SET status = ?, last_output = ?, status_changed_at = ? WHERE video_id = ?",
-        (final_status, output, int(time.time()), video_id),
-    )
-    await db.commit()
-    if request.headers.get("HX-Request"):
-        return await _render_card(video_id)
-    return jsonify({"status": final_status, "exit_code": exit_code, "output": output})
 
 
 @app.post("/videos/<video_id>/hide")
