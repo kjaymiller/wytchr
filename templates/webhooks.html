@@ -65,11 +65,14 @@
   </header>
   <main>
     <p class="hint">
-      Outbound webhooks fire when a wytchr event happens. Today the only event is
-      <code>video.favorited</code> (sent when you tap ★ on a card). The POST body is
-      <code>{"event": "video.favorited", "timestamp": …, "id", "title", "url", "channel", "thumbnail_url", "duration", "upload_date", "description", "notes"}</code>
+      Outbound webhooks fire when a wytchr event happens. Events are
+      <code>video.favorited</code> (sent when you tap ★ on a card) and
+      <code>channel.added</code> (sent when you add a channel with "also add to all-my-favs" ticked).
+      The <code>video.favorited</code> body is
+      <code>{"event", "timestamp", "id", "title", "url", "channel", "thumbnail_url", "duration", "upload_date", "description", "notes"}</code>
       (flat — fields live at the top level alongside <code>event</code>; <code>notes</code> mirrors the YouTube
-      description, fetched lazily on first favorite).
+      description, fetched lazily on first favorite). The <code>channel.added</code> body is
+      <code>{"event", "timestamp", "name", "title", "url", "notes"}</code>.
       If a bearer token is set, it's sent as <code>Authorization: Bearer …</code>.
     </p>
 
@@ -109,6 +112,18 @@
     {% endif %}
 
     <section class="create">
+      <h2>settings</h2>
+      <form method="post" action="/webhooks/always-add-favs">
+        <label style="display:flex; align-items:center; gap:.5rem; color:var(--fg); grid-column:1/-1;">
+          <input type="checkbox" name="enabled" style="width:auto;"
+                 onchange="this.form.submit()" {% if always_favs %}checked{% endif %}>
+          always add new channels to all-my-favs (fire <code>channel.added</code> on every add)
+        </label>
+        <noscript><div class="submit"><button type="submit" class="primary">save</button></div></noscript>
+      </form>
+    </section>
+
+    <section class="create">
       <h2>add webhook</h2>
       <form method="post" action="/webhooks">
         <label for="hook-name">name</label>
@@ -118,6 +133,7 @@
         <label for="hook-event">event</label>
         <select id="hook-event" name="event">
           <option value="video.favorited">video.favorited</option>
+          <option value="channel.added">channel.added</option>
         </select>
         <label for="hook-token">bearer token (optional)</label>
         <input id="hook-token" name="bearer_token" placeholder="leave blank if downstream is unauthenticated">

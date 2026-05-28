@@ -76,6 +76,17 @@
                placeholder="auto-derived from the channel handle">
         <span class="field-hint">the upstream subscription id. Defaults to the channel's @handle.</span>
 
+        <label for="add_to_favs">all-my-favs</label>
+        <label style="display:flex; align-items:center; gap:.4rem; color:var(--fg);">
+          <input id="add_to_favs" name="add_to_favs" type="checkbox" style="width:auto;"
+                 {% if always_favs %}checked{% endif %}>
+          also add this channel link to all-my-favs
+        </label>
+        <span class="field-hint">
+          fires your <code>channel.added</code> webhooks with the channel url.
+          {% if always_favs %}on by default — <a href="/webhooks">change the always-add setting</a>.{% endif %}
+        </span>
+
         <div class="submit">
           <a class="cancel" href="/">cancel</a>
           <button class="primary" type="submit">add channel</button>

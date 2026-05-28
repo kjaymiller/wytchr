@@ -38,7 +38,7 @@ from quart import (
     request,
 )
 
-__version__ = "0.12.3"
+__version__ = "0.13.0"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 # YouTube Data API v3 key. Required — drives channel resolution, the
@@ -172,6 +172,12 @@ CREATE TABLE IF NOT EXISTS channel_settings (
   title_include TEXT,
   title_exclude TEXT,
   updated_at BIGINT NOT NULL
+);
+
+-- App-wide key/value preferences (e.g. always_add_channel_to_favs).
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 """
 
@@ -368,6 +374,21 @@ _CHANNEL_SETTINGS_DEFAULTS = {
     "title_include": None,
     "title_exclude": None,
 }
+
+
+async def _get_setting(db: AsyncPgConn, key: str, default: str = "") -> str:
+    row = await db.execute(
+        "SELECT value FROM app_settings WHERE key = ?", (key,)
+    ).fetchone()
+    return row["value"] if row else default
+
+
+async def _set_setting(db: AsyncPgConn, key: str, value: str) -> None:
+    await db.execute(
+        "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (key, value),
+    )
 
 
 async def _channel_settings_map(db: AsyncPgConn) -> dict[str, dict]:
@@ -1136,11 +1157,13 @@ async def channel_add_page():
         "GROUP BY preset ORDER BY preset COLLATE NOCASE"
     ).fetchall()
     profiles = [r["preset"] for r in rows]
+    always_favs = await _get_setting(db, "always_add_channel_to_favs") == "1"
     return await render_template(
         "channel_add.html",
         profiles=profiles,
         error=request.args.get("error"),
         prefill_url=request.args.get("url", ""),
+        always_favs=always_favs,
     )
 
 
@@ -1168,6 +1191,7 @@ async def channel_add():
     raw_url = (f.get("url") or "").strip()
     override_name = (f.get("name") or "").strip()
     profile = (f.get("profile") or "").strip()
+    add_to_favs = bool(f.get("add_to_favs"))
     if not raw_url:
         return _add_channel_error("url is required")
 
@@ -1195,7 +1219,14 @@ async def channel_add():
             "INSERT INTO channels (name, url, preset) VALUES (?, ?, ?)",
             (name, channel_url, profile),
         )
+        if not add_to_favs:
+            add_to_favs = await _get_setting(db, "always_add_channel_to_favs") == "1"
         await db.commit()
+    if add_to_favs:
+        # Fire-and-forget so the redirect isn't blocked on downstream.
+        asyncio.create_task(
+            _fire_webhooks("channel.added", _channel_payload(name, channel_url))
+        )
     await _start_poll_async()
     return redirect("/")
 
@@ -1527,6 +1558,12 @@ def _video_payload(row) -> dict:
     }
 
 
+def _channel_payload(name: str, url: str) -> dict:
+    # all-my-favs expects bookmark fields at the top level: url, title,
+    # notes. A channel has no description, so notes is left empty.
+    return {"name": name, "title": name, "url": url, "notes": ""}
+
+
 _VIDEO_ID_RE = re.compile(r"(?:v=|/shorts/|youtu\.be/)([A-Za-z0-9_-]{11})")
 
 
@@ -1715,7 +1752,8 @@ async def webhooks_admin():
     hooks = await db.execute(
         "SELECT id, name, url, event, enabled, bearer_token, created_at, last_fired_at, last_status, last_error FROM webhooks ORDER BY id"
     ).fetchall()
-    return await render_template("webhooks.html", hooks=hooks)
+    always_favs = await _get_setting(db, "always_add_channel_to_favs") == "1"
+    return await render_template("webhooks.html", hooks=hooks, always_favs=always_favs)
 
 
 @app.post("/webhooks")
@@ -1734,6 +1772,18 @@ async def webhooks_create():
     await db.execute(
         "INSERT INTO webhooks (name, url, event, bearer_token, created_at) VALUES (?, ?, ?, ?, ?)",
         (name, url, event, bearer, int(time.time())),
+    )
+    await db.commit()
+    return redirect("/webhooks")
+
+
+@app.post("/webhooks/always-add-favs")
+@auth_required
+async def webhooks_set_always_add_favs():
+    f = await request.form
+    db = await get_db()
+    await _set_setting(
+        db, "always_add_channel_to_favs", "1" if f.get("enabled") else "0"
     )
     await db.commit()
     return redirect("/webhooks")
