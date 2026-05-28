@@ -10,7 +10,7 @@ RUN uv pip install --system --no-cache \
     "psycopg[binary]==3.*"
 
 WORKDIR /app
-COPY app.py /app/app.py
+COPY *.py /app/
 COPY templates /app/templates
 
 EXPOSE 5000

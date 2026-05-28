@@ -974,10 +974,9 @@
         if (!card) return;
         const id = card.id && card.id.startsWith('card-') ? card.id.slice(5) : null;
         if (!id) return;
-        // Only flip statuses where 'watched' is meaningful — matches
-        // the existing inline button's visibility (new / failed).
+        // Only flip statuses where 'watched' is meaningful.
         const status = card.dataset.status;
-        if (status !== 'new' && status !== 'failed') return;
+        if (status !== 'new') return;
         // Fire-and-forget; the next board refresh swaps the card out.
         // keepalive lets the request survive if the new tab steals focus.
         fetch(`/videos/${encodeURIComponent(id)}/watched`, {

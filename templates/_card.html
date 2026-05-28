@@ -45,7 +45,7 @@
     {% include "_tags_video.html" %}
   {% endwith %}
   <div class="actions">
-    {% if v.status == 'new' or v.status == 'failed' %}
+    {% if v.status == 'new' %}
       <a class="icon-btn" href="https://www.youtube.com/watch?v={{ v.video_id }}"
          target="_blank" rel="noopener" title="open on YouTube">▶</a>
       <button class="icon-btn"
