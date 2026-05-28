@@ -7,7 +7,8 @@
 # written to .env or any file on disk by this script.
 #
 # Requires:
-#   1Password CLI signed in (`op whoami`) — token is fetched via `op read`
+#   fnox installed; cwd must contain a fnox.toml defining AIVEN_API_TOKEN.
+#   Decryption uses the age identity at ~/.config/fnox/age.txt.
 #   tofu >= 1.6 OR terraform >= 1.5 (prefers tofu; override via $TF_BIN)
 #   docker, docker compose
 #
@@ -65,9 +66,6 @@ case "$INFRA_DIR" in
     exit 2 ;;
 esac
 
-# Override by exporting AIVEN_OP_REF before running.
-AIVEN_OP_REF="${AIVEN_OP_REF:-op://Private/Aiven Homelab API KEY/credential}"
-
 # Pick the IaC binary. Honor $TF_BIN if set, otherwise prefer `tofu`
 # (OpenTofu — Apache-2.0, drop-in compatible) and fall back to
 # `terraform`. Both consume the same main.tf, both write
@@ -87,22 +85,19 @@ elif ! command -v "$TF" >/dev/null 2>&1; then
   exit 1
 fi
 
-for bin in docker op; do
+for bin in docker fnox; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     echo "error: '$bin' not found in PATH." >&2
     exit 1
   fi
 done
 
-if ! op whoami >/dev/null 2>&1; then
-  echo "error: 1Password CLI is not signed in. Run: eval \$(op signin)" >&2
-  exit 1
-fi
-
-# Fetch the token straight into a shell var. Never written to disk.
-AIVEN_API_TOKEN="$(op read "$AIVEN_OP_REF")"
+# Fetch the token straight into a shell var. fnox resolves against the
+# fnox.toml in cwd — the homelab wrapper invokes us with cwd set to
+# compose/wytchr/. Never written to disk.
+AIVEN_API_TOKEN="$(fnox get AIVEN_API_TOKEN)"
 if [[ -z "$AIVEN_API_TOKEN" ]]; then
-  echo "error: op read returned empty for $AIVEN_OP_REF" >&2
+  echo "error: fnox get returned empty for AIVEN_API_TOKEN (check fnox.toml in cwd)" >&2
   exit 1
 fi
 
