@@ -37,7 +37,7 @@ from quart import (
     request,
 )
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 # YouTube Data API v3 key. Required — drives channel resolution, the
@@ -96,7 +96,6 @@ CREATE TABLE IF NOT EXISTS videos (
   thumbnail_url TEXT,
   url TEXT,
   status TEXT NOT NULL DEFAULT 'new',
-  last_output TEXT,
   seen_at BIGINT NOT NULL,
   status_changed_at BIGINT NOT NULL,
   favorited_at BIGINT,
@@ -151,14 +150,11 @@ CREATE INDEX IF NOT EXISTS channel_tags_tag ON channel_tags(tag_id);
 CREATE TABLE IF NOT EXISTS channel_settings (
   channel_name TEXT PRIMARY KEY REFERENCES channels(name) ON DELETE CASCADE,
   display_name TEXT,
-  date_range TEXT,
-  max_files INTEGER,
   include_shorts INTEGER NOT NULL DEFAULT 0,
   hide_channel INTEGER NOT NULL DEFAULT 0,
   auto_watched_days INTEGER,
   title_include TEXT,
   title_exclude TEXT,
-  include_members_only INTEGER NOT NULL DEFAULT 0,
   updated_at BIGINT NOT NULL
 );
 """
@@ -319,13 +315,8 @@ async def init_db() -> None:
         await db.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS favorited_at BIGINT")
         await db.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS description TEXT")
         await db.execute("CREATE INDEX IF NOT EXISTS videos_favorited ON videos(favorited_at DESC)")
-        await db.execute(
-            "ALTER TABLE channel_settings ADD COLUMN IF NOT EXISTS "
-            "include_members_only INTEGER NOT NULL DEFAULT 0"
-        )
-        # Pivot step 3: watchlist + watched-state columns. Wired up by
-        # later steps (#10 poll loop, #12 auto-mark-watched). Additive
-        # only — existing rows are NULL on both columns, which reads as
+        # Pivot step 3: watchlist + watched-state columns. Additive only
+        # — existing rows are NULL on both columns, which reads as
         # "not on watchlist, not watched".
         await db.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS watchlist_added_at BIGINT")
         await db.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS watched_at BIGINT")
@@ -337,20 +328,29 @@ async def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS videos_channel_unwatched "
             "ON videos(channel_name) WHERE watched_at IS NULL"
         )
+        # Pivot step 7: drop ytdl-sub/Jellyfin-era columns. Forward
+        # migration; PG's IF EXISTS makes it a no-op on fresh installs.
+        # Also collapse download-era status values to 'new' so the
+        # status enum becomes (new, watched, hidden).
+        await db.execute("ALTER TABLE videos DROP COLUMN IF EXISTS last_output")
+        await db.execute("ALTER TABLE channel_settings DROP COLUMN IF EXISTS date_range")
+        await db.execute("ALTER TABLE channel_settings DROP COLUMN IF EXISTS max_files")
+        await db.execute("ALTER TABLE channel_settings DROP COLUMN IF EXISTS include_members_only")
+        await db.execute(
+            "UPDATE videos SET status = 'new' "
+            "WHERE status IN ('queued', 'downloading', 'failed', 'done')"
+        )
 
 
 # --- Tags -------------------------------------------------------------
 
 _CHANNEL_SETTINGS_DEFAULTS = {
     "display_name": None,
-    "date_range": None,
-    "max_files": None,
     "include_shorts": 0,
     "hide_channel": 0,
     "auto_watched_days": None,
     "title_include": None,
     "title_exclude": None,
-    "include_members_only": 0,
 }
 
 
@@ -359,23 +359,20 @@ async def _channel_settings_map(db: AsyncPgConn) -> dict[str, dict]:
     without a row return defaults via .get(name, _CHANNEL_SETTINGS_DEFAULTS)
     at the call site."""
     rows = await db.execute(
-        """SELECT channel_name, display_name, date_range, max_files,
+        """SELECT channel_name, display_name,
                   include_shorts, hide_channel, auto_watched_days,
-                  title_include, title_exclude, include_members_only
+                  title_include, title_exclude
              FROM channel_settings"""
     ).fetchall()
     out: dict[str, dict] = {}
     for r in rows:
         out[r["channel_name"]] = {
             "display_name": r["display_name"],
-            "date_range": r["date_range"],
-            "max_files": r["max_files"],
             "include_shorts": int(r["include_shorts"] or 0),
             "hide_channel": int(r["hide_channel"] or 0),
             "auto_watched_days": r["auto_watched_days"],
             "title_include": r["title_include"],
             "title_exclude": r["title_exclude"],
-            "include_members_only": int(r["include_members_only"] or 0),
         }
     return out
 
@@ -503,44 +500,6 @@ def _client() -> httpx.AsyncClient:
         # acceptable for the one-off path.
         return httpx.AsyncClient()
     return _http_client
-
-
-# Profile machinery — currently stubbed. The channels.preset column and
-# the per-channel "profile" UI are repurposed in pivot step 6 to drive
-# the auto-mark-watched window. Until then, callers get an empty profile
-# catalog so dropdowns render with no options instead of crashing.
-async def fetch_presets(force: bool = False) -> dict:  # noqa: ARG001
-    return {"profiles": [], "profile_details": {}, "base_preset": ""}
-
-
-def _resolve_profile(preset_str: str | None, profile_details: dict) -> str | None:  # noqa: ARG001
-    return None
-
-
-def _channel_window(
-    preset_str: str | None, profile_details: dict  # noqa: ARG001
-) -> tuple[int | None, int | None]:
-    return None, None
-
-
-_DATE_RANGE_RE = re.compile(r"(\d+)\s*(day|week|month|year)s?", re.IGNORECASE)
-_DATE_UNITS = {"day": 1, "week": 7, "month": 30, "year": 365}
-
-
-def _parse_date_range(s: str | None) -> int | None:
-    """Parse a date_range token like '7days' / '2weeks' / '6months' /
-    '1year' to a day count. Returns None if unparseable / empty.
-
-    Kept for the per-channel `date_range` override on
-    /channels/<name>/settings; step 6 rewires it to drive the
-    auto-mark-watched window.
-    """
-    if not s:
-        return None
-    m = _DATE_RANGE_RE.match(str(s).strip())
-    if not m:
-        return None
-    return int(m.group(1)) * _DATE_UNITS[m.group(2).lower()]
 
 
 # --- Polling ----------------------------------------------------------
@@ -830,8 +789,14 @@ async def login_submit():
 @app.get("/")
 @auth_required
 async def index():
-    presets_data = await fetch_presets()
-    profiles = sorted((presets_data.get("profile_details") or {}).keys())
+    # Profiles come from the distinct set of channels.preset values,
+    # which the UI uses as free-form section labels.
+    db = await get_db()
+    rows = await db.execute(
+        "SELECT preset FROM channels WHERE preset IS NOT NULL AND preset <> '' "
+        "GROUP BY preset ORDER BY preset COLLATE NOCASE"
+    ).fetchall()
+    profiles = [r["preset"] for r in rows]
     return await render_template(
         "board.html",
         poll_interval=POLL_INTERVAL_MINUTES,
@@ -860,73 +825,35 @@ async def board_partial():
     else:
         # wytchr is a selector, not a library view: only show videos
         # the operator hasn't acted on yet.
-        status_filter = ("new", "queued", "downloading", "failed")
+        status_filter = ("new",)
     status_placeholders = ",".join("?" * len(status_filter))
 
-    presets_data = await fetch_presets()
-    profile_details = presets_data.get("profile_details") or {}
     settings_map = await _channel_settings_map(db)
-    from datetime import datetime, timedelta, timezone
-    now_dt = datetime.now(timezone.utc)
-    now_ts = int(now_dt.timestamp())
+
+    PER_CHANNEL_LIMIT = 20
 
     columns = []
     for ch in channels:
         cs = settings_map.get(ch["name"], _CHANNEL_SETTINGS_DEFAULTS)
         if cs["hide_channel"] and not show_hidden:
             continue
-        prof_days, prof_max = _channel_window(ch["preset"], profile_details)
-        cs_days = _parse_date_range(cs["date_range"]) if cs["date_range"] else None
-        days = cs_days if cs_days is not None else prof_days
-        cs_max = cs["max_files"]
-        max_files = cs_max if (isinstance(cs_max, int) and cs_max > 0) else prof_max
 
-        aw = cs["auto_watched_days"]
-        if isinstance(aw, int) and aw > 0:
-            aw_cutoff = (now_dt - timedelta(days=aw)).strftime("%Y%m%d")
-            await db.execute(
-                """UPDATE videos
-                      SET status = 'watched', status_changed_at = ?
-                    WHERE channel_name = ?
-                      AND status IN ('new', 'failed')
-                      AND upload_date IS NOT NULL
-                      AND upload_date < ?""",
-                (now_ts, ch["name"], aw_cutoff),
-            )
-
-        cutoff = None
-        if days is not None:
-            cutoff = (now_dt - timedelta(days=days)).strftime("%Y%m%d")
-        per_channel_limit = max_files if (max_files is not None and max_files > 0) else 20
+        per_channel_limit = PER_CHANNEL_LIMIT
 
         shorts_clause = "" if cs["include_shorts"] else " AND v.url NOT LIKE '%/shorts/%'"
         shorts_clause_count = "" if cs["include_shorts"] else " AND url NOT LIKE '%/shorts/%'"
         title_inc_re = _compile_title_re(cs["title_include"])
         title_exc_re = _compile_title_re(cs["title_exclude"])
 
-        if cutoff and not show_hidden:
-            count_rows = await db.execute(
-                f"""SELECT status, COUNT(*) AS n FROM videos
-                     WHERE channel_name = ?
-                       {shorts_clause_count}
-                       AND upload_date IS NOT NULL
-                       AND upload_date >= ?
-                  GROUP BY status""",
-                (ch["name"], cutoff),
-            ).fetchall()
-        else:
-            count_rows = await db.execute(
-                f"SELECT status, COUNT(*) AS n FROM videos WHERE channel_name = ? {shorts_clause_count} GROUP BY status",
-                (ch["name"],),
-            ).fetchall()
+        count_rows = await db.execute(
+            f"SELECT status, COUNT(*) AS n FROM videos WHERE channel_name = ? {shorts_clause_count} GROUP BY status",
+            (ch["name"],),
+        ).fetchall()
         counts = {row["status"]: row["n"] for row in count_rows}
-        actionable = counts.get("new", 0) + counts.get("failed", 0)
+        actionable = counts.get("new", 0)
 
         window_clause = ""
         window_args: tuple = ()
-        if cutoff and not show_hidden:
-            window_clause = " AND v.upload_date IS NOT NULL AND v.upload_date >= ?"
-            window_args = (cutoff,)
 
         if tag_filter_id is not None:
             channel_has_tag = await db.execute(
@@ -1007,18 +934,13 @@ async def board_partial():
 
     sections: list[dict] = []
     section_idx: dict[str, int] = {}
-    for profile_name in profile_details:
-        section_idx[profile_name] = len(sections)
-        sections.append({"profile": profile_name, "columns": []})
     for col in columns:
-        profile_name = _resolve_profile(col["channel"]["preset"], profile_details)
-        if profile_name and profile_name in section_idx:
-            sections[section_idx[profile_name]]["columns"].append(col)
-        else:
-            if "" not in section_idx:
-                section_idx[""] = len(sections)
-                sections.append({"profile": "", "columns": []})
-            sections[section_idx[""]]["columns"].append(col)
+        profile_name = (col["channel"].get("preset") or "").strip()
+        if profile_name not in section_idx:
+            section_idx[profile_name] = len(sections)
+            sections.append({"profile": profile_name, "columns": []})
+        sections[section_idx[profile_name]]["columns"].append(col)
+    sections.sort(key=lambda s: (s["profile"] == "", s["profile"].lower()))
     for section in sections:
         section["columns"].sort(key=lambda c: 0 if c["videos"] else 1)
     if tag_filter_name:
@@ -1050,16 +972,12 @@ async def board_partial():
         "channels": len(channels),
         "videos": sum(sum(c["counts"].values()) for c in columns),
         "new": sum(c["counts"].get("new", 0) for c in columns),
-        "failed": sum(c["counts"].get("failed", 0) for c in columns),
-        "queued": sum(c["counts"].get("queued", 0) + c["counts"].get("downloading", 0) for c in columns),
-        "done": sum(c["counts"].get("done", 0) for c in columns),
         "watched": sum(c["counts"].get("watched", 0) for c in columns),
     }
     return await render_template(
         "_board.html",
         columns=columns,
         sections=sections,
-        base_preset=presets_data.get("base_preset", ""),
         show_hidden=show_hidden,
         totals=totals,
         video_tags_map=video_tags_map,
@@ -1196,13 +1114,15 @@ async def tags_admin():
 @app.get("/channels/add")
 @auth_required
 async def channel_add_page():
-    presets_data = await fetch_presets()
-    profile_details = presets_data.get("profile_details") or {}
-    profiles = sorted(profile_details.keys())
+    db = await get_db()
+    rows = await db.execute(
+        "SELECT preset FROM channels WHERE preset IS NOT NULL AND preset <> '' "
+        "GROUP BY preset ORDER BY preset COLLATE NOCASE"
+    ).fetchall()
+    profiles = [r["preset"] for r in rows]
     return await render_template(
         "channel_add.html",
         profiles=profiles,
-        base_preset=presets_data.get("base_preset", ""),
         error=request.args.get("error"),
         prefill_url=request.args.get("url", ""),
     )
@@ -1281,9 +1201,9 @@ async def channel_change_profile(channel_name: str):
 
 async def _get_channel_settings_row(db: AsyncPgConn, channel_name: str) -> dict:
     r = await db.execute(
-        """SELECT display_name, date_range, max_files,
+        """SELECT display_name,
                   include_shorts, hide_channel, auto_watched_days,
-                  title_include, title_exclude, include_members_only
+                  title_include, title_exclude
              FROM channel_settings WHERE channel_name = ?""",
         (channel_name,),
     ).fetchone()
@@ -1291,14 +1211,11 @@ async def _get_channel_settings_row(db: AsyncPgConn, channel_name: str) -> dict:
         return dict(_CHANNEL_SETTINGS_DEFAULTS)
     return {
         "display_name": r["display_name"],
-        "date_range": r["date_range"],
-        "max_files": r["max_files"],
         "include_shorts": int(r["include_shorts"] or 0),
         "hide_channel": int(r["hide_channel"] or 0),
         "auto_watched_days": r["auto_watched_days"],
         "title_include": r["title_include"],
         "title_exclude": r["title_exclude"],
-        "include_members_only": int(r["include_members_only"] or 0),
     }
 
 
@@ -1312,15 +1229,10 @@ async def channel_settings_page(channel_name: str):
     if not ch:
         return ("channel not found", 404)
     settings = await _get_channel_settings_row(db, channel_name)
-    presets_data = await fetch_presets()
-    profile_details = presets_data.get("profile_details") or {}
-    prof_days, prof_max = _channel_window(ch["preset"], profile_details)
     return await render_template(
         "channel_settings.html",
         channel=ch,
         settings=settings,
-        profile_days=prof_days,
-        profile_max=prof_max,
         saved=request.args.get("saved") == "1",
     )
 
@@ -1349,49 +1261,38 @@ async def channel_settings_save(channel_name: str):
 
     payload = {
         "display_name": _opt_str("display_name"),
-        "date_range": _opt_str("date_range"),
-        "max_files": _opt_int("max_files"),
         "include_shorts": 1 if f.get("include_shorts") else 0,
         "hide_channel": 1 if f.get("hide_channel") else 0,
         "auto_watched_days": _opt_int("auto_watched_days"),
         "title_include": _opt_str("title_include"),
         "title_exclude": _opt_str("title_exclude"),
-        "include_members_only": 1 if f.get("include_members_only") else 0,
     }
     for key in ("title_include", "title_exclude"):
         if payload[key] and _compile_title_re(payload[key]) is None:
             return (f"invalid regex for {key}: {payload[key]}", 400)
-    if payload["date_range"] and _parse_date_range(payload["date_range"]) is None:
-        return ("invalid date_range (try '7days', '2weeks', '6months', '1year')", 400)
 
     await db.execute(
         """INSERT INTO channel_settings
-             (channel_name, display_name, date_range, max_files,
+             (channel_name, display_name,
               include_shorts, hide_channel, auto_watched_days,
-              title_include, title_exclude, include_members_only, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              title_include, title_exclude, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(channel_name) DO UPDATE SET
              display_name = excluded.display_name,
-             date_range = excluded.date_range,
-             max_files = excluded.max_files,
              include_shorts = excluded.include_shorts,
              hide_channel = excluded.hide_channel,
              auto_watched_days = excluded.auto_watched_days,
              title_include = excluded.title_include,
              title_exclude = excluded.title_exclude,
-             include_members_only = excluded.include_members_only,
              updated_at = excluded.updated_at""",
         (
             channel_name,
             payload["display_name"],
-            payload["date_range"],
-            payload["max_files"],
             payload["include_shorts"],
             payload["hide_channel"],
             payload["auto_watched_days"],
             payload["title_include"],
             payload["title_exclude"],
-            payload["include_members_only"],
             int(time.time()),
         ),
     )
@@ -1544,7 +1445,7 @@ async def mark_channel_watched(channel_name: str):
               SET status = 'watched', status_changed_at = ?,
                   watched_at = COALESCE(watched_at, ?)
             WHERE channel_name = ?
-              AND status IN ('new', 'failed')""",
+              AND status = 'new'""",
         (now, now, channel_name),
     )
     await db.commit()
@@ -1867,7 +1768,7 @@ async def auto_mark_watched() -> dict:
     Reads channel_settings.auto_watched_days as the per-channel window
     (NULL = never auto-watch). For each channel with a window set, any
     video whose seen_at predates now − window AND has watched_at IS NULL
-    AND status is in ('new', 'failed') flips to status='watched',
+    AND status = 'new' flips to status='watched',
     watched_at=now(). Manual marks aren't overwritten — they already
     have watched_at populated.
     """
@@ -1888,7 +1789,7 @@ async def auto_mark_watched() -> dict:
                           watched_at = ?
                     WHERE channel_name = ?
                       AND watched_at IS NULL
-                      AND status IN ('new', 'failed')
+                      AND status = 'new'
                       AND seen_at < ?""",
                 (now, now, r["channel_name"], cutoff),
             )

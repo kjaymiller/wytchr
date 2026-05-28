@@ -62,13 +62,14 @@
                value="{{ prefill_url }}">
 
         <label for="profile">profile</label>
-        <select id="profile" name="profile">
-          <option value="">(base preset only)</option>
+        <input id="profile" name="profile" type="text" list="profile-options"
+               placeholder="(no profile)">
+        <datalist id="profile-options">
           {% for p in profiles %}
-            <option value="{{ p }}">{{ p }}</option>
+            <option value="{{ p }}">
           {% endfor %}
-        </select>
-        <span class="field-hint">profile-driven defaults for date_range, max_files, etc.</span>
+        </datalist>
+        <span class="field-hint">free-form group label. controls the auto-mark-watched window via channel settings.</span>
 
         <label for="name">name <span style="color:var(--muted)">(optional)</span></label>
         <input id="name" name="name" type="text"

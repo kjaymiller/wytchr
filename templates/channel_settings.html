@@ -54,13 +54,7 @@
 <main>
   <h2 style="margin: 0 0 .25rem;">{{ channel.name }} settings</h2>
   <p class="meta">
-    preset: <code>{{ channel.preset }}</code>
-    {% if profile_days or profile_max %}
-      · profile defaults:
-      {% if profile_days %}{{ profile_days }} days{% endif %}
-      {% if profile_days and profile_max %} · {% endif %}
-      {% if profile_max %}max {{ profile_max }}{% endif %}
-    {% endif %}
+    profile: <code>{{ channel.preset or '—' }}</code>
   </p>
   {% if saved %}<div class="flash">saved.</div>{% endif %}
 
@@ -77,23 +71,6 @@
     </div>
 
     <div class="card">
-      <h2>window overrides</h2>
-      <p class="hint">leave blank to inherit from the profile. examples: <code>14days</code>, <code>2weeks</code>, <code>6months</code>, <code>1year</code>.</p>
-      <div class="row">
-        <label for="date_range">date range</label>
-        <input type="text" id="date_range" name="date_range"
-               value="{{ settings.date_range or '' }}"
-               placeholder="{% if profile_days %}{{ profile_days }} days (profile default){% else %}—{% endif %}">
-      </div>
-      <div class="row">
-        <label for="max_files">max videos</label>
-        <input type="number" id="max_files" name="max_files" min="1"
-               value="{{ settings.max_files if settings.max_files is not none else '' }}"
-               placeholder="{% if profile_max %}{{ profile_max }} (profile default){% else %}—{% endif %}">
-      </div>
-    </div>
-
-    <div class="card">
       <h2>display toggles</h2>
       <label class="check-row">
         <input type="checkbox" name="include_shorts" {% if settings.include_shorts %}checked{% endif %}>
@@ -103,15 +80,11 @@
         <input type="checkbox" name="hide_channel" {% if settings.hide_channel %}checked{% endif %}>
         <span>hide this channel from the board</span>
       </label>
-      <label class="check-row">
-        <input type="checkbox" name="include_members_only" {% if settings.include_members_only %}checked{% endif %}>
-        <span>include members-only content (default: excluded — enable only if you're a member)</span>
-      </label>
     </div>
 
     <div class="card">
       <h2>auto-mark watched</h2>
-      <p class="hint">videos older than N days flip from <code>new</code>/<code>failed</code> to <code>watched</code> automatically. blank to disable.</p>
+      <p class="hint">videos older than N days flip from <code>new</code> to <code>watched</code> automatically. blank to disable.</p>
       <div class="row">
         <label for="auto_watched_days">days</label>
         <input type="number" id="auto_watched_days" name="auto_watched_days" min="1"

@@ -2,9 +2,6 @@
   <span><strong>{{ totals.channels }}</strong> channels</span>
   <span><strong>{{ totals.videos }}</strong> videos</span>
   {% if totals.new %}<span class="hot"><strong>{{ totals.new }}</strong> new</span>{% endif %}
-  {% if totals.queued %}<span><strong>{{ totals.queued }}</strong> queued</span>{% endif %}
-  {% if totals.failed %}<span class="bad"><strong>{{ totals.failed }}</strong> failed</span>{% endif %}
-  <span class="muted"><strong>{{ totals.done }}</strong> done</span>
   {% if totals.watched %}<span class="muted"><strong>{{ totals.watched }}</strong> watched</span>{% endif %}
 </div>
 {% if all_tags or active_tag %}
@@ -42,7 +39,7 @@
   </div>
 {% endif %}
 
-<div class="sections" data-base-preset="{{ base_preset }}">
+<div class="sections">
   {% for section in sections %}
     <section class="section" data-profile="{{ section.profile }}">
       <header class="section-header">
