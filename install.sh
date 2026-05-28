@@ -85,6 +85,16 @@ elif ! command -v "$TF" >/dev/null 2>&1; then
   exit 1
 fi
 
+# fnox is installed via mise; its shims are only on PATH in shells that
+# ran `mise activate`. The interactive shell does, but a plain `bash -lc`
+# (how the homelab wrapper invokes us) does not — so pull mise's shims
+# onto PATH ourselves before looking fnox up.
+if ! command -v fnox >/dev/null 2>&1; then
+  mise_bin="$(command -v mise || true)"
+  : "${mise_bin:=$HOME/.local/bin/mise}"
+  [[ -x "$mise_bin" ]] && eval "$("$mise_bin" activate bash --shims)"
+fi
+
 for bin in docker fnox; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     echo "error: '$bin' not found in PATH." >&2
