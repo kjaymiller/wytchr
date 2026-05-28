@@ -20,6 +20,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from functools import wraps
+from urllib.parse import urlencode
 
 import httpx
 import psycopg
@@ -37,7 +38,7 @@ from quart import (
     request,
 )
 
-__version__ = "0.12.1"
+__version__ = "0.12.2"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 # YouTube Data API v3 key. Required — drives channel resolution, the
@@ -1138,6 +1139,13 @@ def _channel_id_from_url(url: str) -> str:
     return _NAME_RE.sub("-", tail.lstrip("@")).strip("-")
 
 
+def _add_channel_error(msg: str, **extra: str):
+    """Redirect back to the add form with a URL-encoded error. Encoding
+    matters: resolve failures surface raw API error bodies (with newlines,
+    quotes, &) that would otherwise produce an invalid Location header."""
+    return redirect("/channels/add?" + urlencode({"error": msg, **extra}))
+
+
 @app.post("/channels/add")
 @auth_required
 async def channel_add():
@@ -1146,19 +1154,18 @@ async def channel_add():
     override_name = (f.get("name") or "").strip()
     profile = (f.get("profile") or "").strip()
     if not raw_url:
-        return redirect("/channels/add?error=url+is+required")
+        return _add_channel_error("url is required")
 
     try:
         resolved = await _resolve_channel(raw_url)
     except Exception as exc:  # noqa: BLE001
-        msg = str(exc)[:200].replace(" ", "+")
-        return redirect(f"/channels/add?error=could+not+resolve:+{msg}&url={raw_url}")
+        return _add_channel_error(f"could not resolve: {str(exc)[:200]}", url=raw_url)
 
     channel_url = resolved["channel_url"]
     name = override_name or resolved["handle"] or _channel_id_from_url(channel_url)
     name = _NAME_RE.sub("-", name).strip("-")
     if not name:
-        return redirect(f"/channels/add?error=could+not+derive+a+name&url={raw_url}")
+        return _add_channel_error("could not derive a name", url=raw_url)
 
     # Write to the local channels table. The `profile` column gets
     # repurposed in pivot step 6 (auto-mark-watched window); for now it
@@ -1168,7 +1175,7 @@ async def channel_add():
             "SELECT 1 FROM channels WHERE name = ?", (name,)
         ).fetchone()
         if existing:
-            return redirect(f"/channels/add?error=already+subscribed&url={raw_url}")
+            return _add_channel_error("already subscribed", url=raw_url)
         await db.execute(
             "INSERT INTO channels (name, url, preset) VALUES (?, ?, ?)",
             (name, channel_url, profile),
