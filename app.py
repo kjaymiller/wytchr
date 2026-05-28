@@ -38,7 +38,7 @@ from quart import (
     request,
 )
 
-__version__ = "0.12.2"
+__version__ = "0.12.3"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 # YouTube Data API v3 key. Required — drives channel resolution, the
@@ -62,6 +62,21 @@ if not YOUTUBE_API_KEY:
         file=sys.stderr,
     )
     sys.exit(1)
+
+# Google API keys are `AIza` + 35 url-safe chars. A common misconfig is
+# pasting an OAuth2 access token (`ya29.`/`AQ.`) instead — YouTube then
+# rejects every call with 401 "API keys are not supported by this API".
+# Warn loudly at boot rather than letting it surface on first use. Not
+# fatal, to avoid locking out a valid key in some future format.
+if not re.fullmatch(r"AIza[0-9A-Za-z_-]{35}", YOUTUBE_API_KEY):
+    print(
+        "WARNING: YOUTUBE_API_KEY does not look like a Google API key "
+        "(expected 'AIza' + 35 chars). If it starts with 'ya29.' or 'AQ.' "
+        "it's an OAuth2 access token, not an API key — channel resolution "
+        "and polling will fail with 401. Create an API key under "
+        "Google Cloud Console > APIs & Services > Credentials.",
+        file=sys.stderr,
+    )
 
 app = Quart(__name__)
 
