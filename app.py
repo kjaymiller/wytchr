@@ -38,7 +38,7 @@ from quart import (
     request,
 )
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 # YouTube Data API v3 key. Required — drives channel resolution, the
@@ -563,6 +563,17 @@ async def _resolve_channel_id_for_poll(db: AsyncPgConn, name: str, url: str) -> 
         "UPDATE channels SET url = ? WHERE name = ?", (canonical, name)
     )
     return resolved["channel_id"]
+
+
+_YOUTUBE_FEED_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={}"
+
+
+def _feed_url_from_channel_url(url: str) -> str | None:
+    """Native YouTube RSS feed URL for a channel, derived from its stored
+    URL. Returns None when the URL isn't in canonical /channel/UC... form
+    yet (a just-added channel gets canonicalized on its first poll)."""
+    m = _CHANNEL_URL_ID_RE.search(url or "")
+    return _YOUTUBE_FEED_URL.format(m.group(1)) if m else None
 
 
 def _isoduration_seconds(iso: str | None) -> int | None:
@@ -1286,6 +1297,7 @@ async def channel_settings_page(channel_name: str):
         "channel_settings.html",
         channel=ch,
         settings=settings,
+        feed_url=_feed_url_from_channel_url(ch["url"]),
         saved=request.args.get("saved") == "1",
     )
 

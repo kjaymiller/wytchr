@@ -26,6 +26,9 @@
     .row { display: grid; grid-template-columns: 11rem 1fr; gap: .5rem .85rem; align-items: center; margin-bottom: .55rem; }
     .row label { color: var(--muted); font-size: .82rem; }
     .row .placeholder-note { color: var(--muted); font-size: .72rem; padding-left: .25rem; grid-column: 2; margin-top: -.35rem; }
+    .feed-row { display: flex; gap: .5rem; align-items: center; }
+    .feed-row input { flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; }
+    .feed-row button { white-space: nowrap; }
     input[type=text], input[type=number] {
       background: var(--bg); color: var(--fg);
       border: 1px solid var(--line); border-radius: 4px;
@@ -45,6 +48,22 @@
 <body data-theme="licorice">
 <script>
   try { const t = localStorage.getItem('wytchr.theme'); if (t) document.body.setAttribute('data-theme', t); } catch (e) {}
+  function copyFeed() {
+    const inp = document.getElementById('feed_url');
+    const btn = document.getElementById('copy_feed');
+    if (!inp || !btn) return;
+    const flash = () => {
+      const orig = btn.textContent;
+      btn.textContent = 'copied!';
+      setTimeout(() => { btn.textContent = orig; }, 1200);
+    };
+    const fallback = () => { inp.focus(); inp.select(); try { document.execCommand('copy'); } catch (e) {} flash(); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(inp.value).then(flash).catch(fallback);
+    } else {
+      fallback();
+    }
+  }
 </script>
 <header>
   <h1>wytchr</h1>
@@ -57,6 +76,20 @@
     profile: <code>{{ channel.preset or '—' }}</code>
   </p>
   {% if saved %}<div class="flash">saved.</div>{% endif %}
+
+  <div class="card">
+    <h2>rss feed</h2>
+    {% if feed_url %}
+    <p class="hint">native YouTube feed for this channel — paste into any feed or podcast reader.</p>
+    <div class="feed-row">
+      <input type="text" id="feed_url" value="{{ feed_url }}" readonly
+             onfocus="this.select()" aria-label="rss feed url">
+      <button type="button" id="copy_feed" onclick="copyFeed()">copy</button>
+    </div>
+    {% else %}
+    <p class="hint">available after this channel's first poll (once its canonical ID is resolved).</p>
+    {% endif %}
+  </div>
 
   <form method="post" action="/channels/{{ channel.name }}/settings">
     <div class="card">
