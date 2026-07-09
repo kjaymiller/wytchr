@@ -1,0 +1,53 @@
+#:schema https://pitchfork.jdx.dev/schema.json
+#
+# wytchr local dev stack, supervised by pitchfork (https://pitchfork.jdx.dev).
+#
+# Two daemons: a throwaway Postgres in Docker, and the Quart app run natively
+# via uv with hot-restart on source changes. This is DEV ONLY — production is
+# the container in homelab/compose/wytchr against Aiven PG. Nothing here talks
+# to Aiven or to the prod DB.
+#
+#   pitchfork start --group wytchr    # bring the whole stack up
+#   pitchfork logs -f web             # tail the app
+#   pitchfork stop  --group wytchr    # tear it down
+#
+# See DEVELOPING.md for the full guide.
+
+namespace = "wytchr"
+
+# ── Local dev Postgres ──────────────────────────────────────────────────────
+# Throwaway PG in a container on host port 5433 (5432 is left free for any
+# system Postgres). Data persists in the named volume `wytchr-dev-pg` across
+# restarts; `docker volume rm wytchr-dev-pg` for a clean slate. The app's
+# init_db() creates every table with CREATE TABLE IF NOT EXISTS, so a blank
+# volume just works on first boot.
+[daemons.postgres]
+run = "exec docker run --rm --name wytchr-dev-pg -e POSTGRES_USER=wytchr -e POSTGRES_PASSWORD=wytchr -e POSTGRES_DB=wytchr -v wytchr-dev-pg:/var/lib/postgresql -p 5433:5432 postgres:18-alpine"
+ready_cmd = "docker exec wytchr-dev-pg pg_isready -U wytchr -d wytchr"
+stop_signal = { signal = "SIGINT", timeout = "10s" }  # PG fast-shutdown on SIGINT
+
+# ── wytchr app (Quart + hypercorn) ──────────────────────────────────────────
+# uv assembles an ephemeral env from the Dockerfile's pinned deps (no lockfile
+# in the repo yet) and runs hypercorn, same server as prod. Binds 5050 so it
+# never collides with the prod container's 5000. `watch` restarts the app on
+# any .py or template edit — that's your dev loop.
+#
+# Secrets: the run line sources ./.env (gitignored) for YOUTUBE_API_KEY,
+# API_TOKEN, POLL_*. DATABASE_URL below points at the local dev PG and is NOT
+# in .env, so sourcing .env never clobbers it. Copy .env.example -> .env and
+# fill YOUTUBE_API_KEY before first start.
+[daemons.web]
+run = "set -a; [ -f .env ] && . ./.env; set +a; exec uv run --python 3.13 --with 'quart==0.20.*' --with 'hypercorn==0.17.*' --with 'apscheduler==3.*' --with 'httpx==0.28.*' --with 'psycopg[binary]==3.*' hypercorn app:app --bind 127.0.0.1:5050 --workers 1 --access-logfile -"
+depends = ["postgres"]
+ready_port = 5050
+watch = ["*.py", "templates/**/*.html"]
+retry = 3
+env = { DATABASE_URL = "postgres://wytchr:wytchr@127.0.0.1:5433/wytchr" }
+# Uncomment to auto-start on `cd` into this repo and auto-stop on leave.
+# Requires the pitchfork shell hook (see DEVELOPING.md). Off by default so a
+# plain `cd` doesn't spin up a Docker Postgres unexpectedly.
+# auto = ["start", "stop"]
+
+# ── Batch handle for the whole stack ────────────────────────────────────────
+[groups.wytchr]
+daemons = ["postgres", "web"]

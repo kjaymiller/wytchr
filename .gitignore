@@ -9,3 +9,4 @@ venv/
 !.env.example
 data/
 .DS_Store
+pitchfork.local.toml
