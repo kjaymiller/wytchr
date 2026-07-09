@@ -239,6 +239,9 @@
     .row-settings:hover { color: var(--accent); }
     .row-mark-watched { background: transparent; border: none; color: var(--muted); cursor: pointer; font: inherit; font-size: .9rem; line-height: 1; padding: 0 .15rem; flex-shrink: 0; }
     .row-mark-watched:hover { color: var(--ok); }
+    .row-rss { background: transparent; border: none; color: var(--muted); cursor: pointer; font: inherit; font-size: .62rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; line-height: 1; padding: 0 .2rem; flex-shrink: 0; }
+    .row-rss:hover { color: var(--accent); }
+    .row-rss.copied { color: var(--ok); }
     #poll-toast {
       position: fixed; bottom: 1rem; right: 1rem; z-index: 60;
       background: var(--card); border: 1px solid var(--accent);
@@ -1061,6 +1064,47 @@
         syncLabel();
       });
       syncLabel();
+    })();
+  </script>
+  <script>
+    // Copy a channel's RSS feed URL to the clipboard. Delegated so it
+    // survives the HTMX board re-renders that replace #board's contents.
+    (function() {
+      function fallbackCopy(text) {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        try { document.execCommand('copy'); } catch (e) {}
+        ta.remove();
+      }
+      document.body.addEventListener('click', (e) => {
+        const btn = e.target.closest('.row-rss');
+        if (!btn) return;
+        const url = btn.dataset.feed;
+        if (!url) return;
+        const flash = () => {
+          if (btn.dataset.busy) return;
+          btn.dataset.busy = '1';
+          const orig = btn.textContent;
+          btn.classList.add('copied');
+          btn.textContent = '✓';
+          setTimeout(() => {
+            btn.textContent = orig;
+            btn.classList.remove('copied');
+            delete btn.dataset.busy;
+          }, 1000);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(url).then(flash).catch(() => { fallbackCopy(url); flash(); });
+        } else {
+          fallbackCopy(url);
+          flash();
+        }
+      });
     })();
   </script>
   <div style="position: fixed; bottom: .5rem; right: .75rem; color: #6a5f6a; font-size: .7rem; pointer-events: none; z-index: 100;">v{{ app_version }}</div>
