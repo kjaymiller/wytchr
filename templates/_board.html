@@ -67,6 +67,11 @@
                           title="mark all as watched"
                           aria-label="mark all videos from {{ ch.name }} as watched">✓</button>
                 {% endif %}
+                {% if ch.feed_url %}
+                  <button type="button" class="row-rss" data-feed="{{ ch.feed_url }}"
+                          title="copy RSS feed URL"
+                          aria-label="copy RSS feed URL for {{ ch.name }}">rss</button>
+                {% endif %}
                 <a class="row-settings" href="/channels/{{ ch.name }}/settings" title="channel settings" aria-label="settings for {{ ch.name }}">⚙</a>
               </div>
               <div class="counts">

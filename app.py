@@ -38,7 +38,7 @@ from quart import (
     request,
 )
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 # YouTube Data API v3 key. Required — drives channel resolution, the
@@ -966,6 +966,7 @@ async def board_partial():
 
         ch_dict = dict(ch)
         ch_dict["display_name"] = cs["display_name"] or ch["name"]
+        ch_dict["feed_url"] = _feed_url_from_channel_url(ch["url"])
         default_open = (
             (counts.get("hidden", 0) > 0) if show_hidden else (actionable > 0)
         )
