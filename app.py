@@ -38,7 +38,7 @@ from quart import (
     request,
 )
 
-__version__ = "0.16.0"
+__version__ = "0.17.0"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 # YouTube Data API v3 key. Required — drives channel resolution, the
@@ -1164,6 +1164,92 @@ async def tags_admin():
         })
     flash = request.args.get("flash") or ""
     return await render_template("tags.html", grouped=grouped, flash=flash)
+
+
+def _humanize_ago(ts: int | None, now: int) -> str:
+    """Epoch seconds → 'never' / 'just now' / '5m ago' / '3h ago' / '2d ago'.
+    Poll times are only ever read at a glance, so order of magnitude is
+    all the operator needs."""
+    if not ts:
+        return "never"
+    delta = max(0, now - int(ts))
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    return f"{delta // 86400}d ago"
+
+
+@app.get("/channels")
+@auth_required
+async def channels_admin():
+    db = await get_db()
+    channels = await db.execute(
+        "SELECT name, url, preset, last_polled_at, last_error FROM channels ORDER BY name COLLATE NOCASE"
+    ).fetchall()
+    settings_map = await _channel_settings_map(db)
+    # One grouped pass over videos for the whole roster. The board does
+    # this per channel, which is tolerable when most columns are skipped
+    # but silly on a page whose entire job is to show every channel.
+    # Shorts are split out here so the counts can honour each channel's
+    # include_shorts without a second query.
+    count_rows = await db.execute(
+        """SELECT channel_name, status,
+                  (url LIKE '%/shorts/%') AS is_short,
+                  COUNT(*) AS n
+             FROM videos
+         GROUP BY channel_name, status, (url LIKE '%/shorts/%')"""
+    ).fetchall()
+    counts_map: dict[str, dict[str, int]] = {}
+    shorts_map: dict[str, dict[str, int]] = {}
+    for r in count_rows:
+        target = shorts_map if r["is_short"] else counts_map
+        bucket = target.setdefault(r["channel_name"], {})
+        bucket[r["status"]] = bucket.get(r["status"], 0) + r["n"]
+
+    now = int(time.time())
+    rows = []
+    for ch in channels:
+        cs = settings_map.get(ch["name"], _CHANNEL_SETTINGS_DEFAULTS)
+        counts = dict(counts_map.get(ch["name"], {}))
+        if cs["include_shorts"]:
+            for status, n in shorts_map.get(ch["name"], {}).items():
+                counts[status] = counts.get(status, 0) + n
+        display_name = cs["display_name"] or ch["name"]
+        rows.append(
+            {
+                "name": ch["name"],
+                "url": ch["url"],
+                "preset": (ch["preset"] or "").strip(),
+                "display_name": display_name,
+                # Only worth showing the real name when it isn't the label.
+                "aliased": display_name != ch["name"],
+                "include_shorts": cs["include_shorts"],
+                "hide_channel": cs["hide_channel"],
+                "auto_watched_days": cs["auto_watched_days"],
+                "new": counts.get("new", 0),
+                "watched": counts.get("watched", 0),
+                "hidden": counts.get("hidden", 0),
+                "last_polled_at": ch["last_polled_at"] or 0,
+                "last_polled": _humanize_ago(ch["last_polled_at"], now),
+                "last_error": ch["last_error"],
+            }
+        )
+    # Roster-wide summary. The board used to carry these four figures in
+    # its own header; it can't any more now that its columns are served
+    # from a cache, so this page — which always reads Postgres — owns
+    # them. Every channel counts, hidden and empty ones included.
+    totals = {
+        "channels": len(rows),
+        "videos": sum(r["new"] + r["watched"] + r["hidden"] for r in rows),
+        "new": sum(r["new"] for r in rows),
+        "watched": sum(r["watched"] for r in rows),
+        "hidden_channels": sum(1 for r in rows if r["hide_channel"]),
+        "erroring": sum(1 for r in rows if r["last_error"]),
+    }
+    return await render_template("channels.html", channels=rows, totals=totals)
 
 
 @app.get("/channels/add")
