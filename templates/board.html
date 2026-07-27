@@ -143,11 +143,6 @@
     #settings-panel[hidden] { display: none; }
     .section[data-search-empty="1"] { display: none; }
     main { padding: 1rem; }
-    .stats { display: flex; flex-wrap: wrap; gap: 0 1.25rem; padding: .25rem .25rem 1rem; color: var(--muted); font-size: .85rem; align-items: baseline; }
-    .stats strong { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
-    .stats .hot strong { color: var(--accent); }
-    .stats .bad strong { color: var(--danger); }
-    .stats .muted strong { color: var(--muted); }
     /* Sectioned layout: one block per profile, with the channel
        columns inside laid out as multi-column flow. SortableJS
        lets the operator drag channels between sections to
@@ -237,8 +232,9 @@
     .channel-head .summary-row .title:hover { color: var(--accent); }
     .row-settings { color: var(--muted); text-decoration: none; font-size: .9rem; line-height: 1; padding: 0 .15rem; flex-shrink: 0; }
     .row-settings:hover { color: var(--accent); }
-    .row-mark-watched { background: transparent; border: none; color: var(--muted); cursor: pointer; font: inherit; font-size: .9rem; line-height: 1; padding: 0 .15rem; flex-shrink: 0; }
-    .row-mark-watched:hover { color: var(--ok); }
+    .row-bulk { background: transparent; border: none; color: var(--muted); cursor: pointer; font: inherit; font-size: .62rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; line-height: 1; padding: 0 .2rem; flex-shrink: 0; white-space: nowrap; }
+    .row-watch-all:hover { color: var(--ok); }
+    .row-skip-all:hover { color: var(--danger); }
     .row-rss { background: transparent; border: none; color: var(--muted); cursor: pointer; font: inherit; font-size: .62rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; line-height: 1; padding: 0 .2rem; flex-shrink: 0; }
     .row-rss:hover { color: var(--accent); }
     .row-rss.copied { color: var(--ok); }
@@ -838,6 +834,25 @@
         } else {
           line = `☆ unfavorited <strong>${safeTitle}</strong>`;
         }
+        toast.innerHTML = `<button class="close" type="button" aria-label="dismiss">×</button><div class="summary-line">${line}</div>`;
+        toast.hidden = false;
+        toast.classList.remove('fading');
+        toast.querySelector('.close').addEventListener('click', close);
+        if (dismissTimer) clearTimeout(dismissTimer);
+        dismissTimer = setTimeout(() => {
+          toast.classList.add('fading');
+          setTimeout(close, 280);
+        }, 2800);
+      });
+      // Bulk channel actions: watch-all / skip-all swap the board and
+      // fire `wytchr:channel-bulk` with {channel, action, marked}. The
+      // wording matters — a skip is a dismissal, not a view.
+      document.body.addEventListener('wytchr:channel-bulk', (e) => {
+        const s = e.detail || {};
+        const n = s.marked || 0;
+        const verb = s.action === 'skip' ? 'skipped' : 'marked watched';
+        const line = `<strong>${n}</strong> video${n === 1 ? '' : 's'} from `
+          + `<strong>${escape(s.channel || '')}</strong> ${verb}`;
         toast.innerHTML = `<button class="close" type="button" aria-label="dismiss">×</button><div class="summary-line">${line}</div>`;
         toast.hidden = false;
         toast.classList.remove('fading');

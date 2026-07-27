@@ -1,9 +1,3 @@
-<div class="stats">
-  <span><strong>{{ totals.channels }}</strong> channels</span>
-  <span><strong>{{ totals.videos }}</strong> videos</span>
-  {% if totals.new %}<span class="hot"><strong>{{ totals.new }}</strong> new</span>{% endif %}
-  {% if totals.watched %}<span class="muted"><strong>{{ totals.watched }}</strong> watched</span>{% endif %}
-</div>
 {% if all_tags or active_tag %}
   {% set base_qs = ('hidden=1' if show_hidden else '') %}
   <div class="filter-bar">
@@ -59,13 +53,21 @@
                 <span class="drag-handle" title="drag to move, or click to pick a profile" tabindex="0" role="button" aria-label="move {{ ch.name }} to a different profile">⋮⋮</span>
                 <a class="title" href="{{ ch.url }}" target="_blank" rel="noopener" title="{{ ch.name }}">{{ ch.display_name or ch.name }}</a>
                 {% if not show_hidden and col.actionable %}
-                  <button type="button" class="row-mark-watched"
-                          hx-post="/channels/{{ ch.name }}/mark-watched"
+                  {% set bulk_n = col.actionable %}
+                  <button type="button" class="row-bulk row-watch-all"
+                          hx-post="/channels/{{ ch.name }}/watch-all"
                           hx-target="#board"
                           hx-swap="innerHTML"
-                          hx-confirm="Mark all {{ col.actionable }} unwatched video{{ '' if col.actionable == 1 else 's' }} from {{ ch.display_name or ch.name }} as watched?"
-                          title="mark all as watched"
-                          aria-label="mark all videos from {{ ch.name }} as watched">✓</button>
+                          hx-confirm="Mark all {{ bulk_n }} video{{ '' if bulk_n == 1 else 's' }} from {{ ch.display_name or ch.name }} as watched?"
+                          title="watch all"
+                          aria-label="mark all videos from {{ ch.name }} as watched">watch all</button>
+                  <button type="button" class="row-bulk row-skip-all"
+                          hx-post="/channels/{{ ch.name }}/skip-all"
+                          hx-target="#board"
+                          hx-swap="innerHTML"
+                          hx-confirm="Skip all {{ bulk_n }} video{{ '' if bulk_n == 1 else 's' }} from {{ ch.display_name or ch.name }}? They move to the hidden pile, not watched."
+                          title="skip all"
+                          aria-label="skip all videos from {{ ch.name }}">skip all</button>
                 {% endif %}
                 {% if ch.feed_url %}
                   <button type="button" class="row-rss" data-feed="{{ ch.feed_url }}"
@@ -113,6 +115,14 @@
            hx-target="#board"
            hx-swap="innerHTML"
            hx-push-url="{% if show_hidden %}?hidden=1{% else %}/{% endif %}">clear filter</a>.
+      {% elif has_channels %}
+        {# channels exist, they just have nothing to show right now #}
+        {% if show_hidden %}
+          Nothing hidden. <a href="/" hx-get="/board" hx-target="#board" hx-swap="innerHTML" hx-push-url="/">back to the board</a>.
+        {% else %}
+          All caught up — no channel has new videos to show.
+          <a href="?hidden=1" hx-get="/board?hidden=1" hx-target="#board" hx-swap="innerHTML" hx-push-url="?hidden=1">show hidden</a>.
+        {% endif %}
       {% else %}
         No channels yet. <a href="/channels/add">Add one</a> from a YouTube video or channel URL.
       {% endif %}
