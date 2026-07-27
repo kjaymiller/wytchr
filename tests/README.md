@@ -49,6 +49,8 @@ the prod Aiven Postgres.
 
 Stack:
 - **pg** — Postgres 16 on tmpfs (state resets every `up`)
+- **valkey** — board read cache, no persistence. The app requires
+  `VALKEY_URL` and won't boot without it, so this is not optional.
 - **wytchr** — built from the repo root `Dockerfile`, exposed on
   host port **5050** so it doesn't collide with a prod wytchr on `:5000`
 

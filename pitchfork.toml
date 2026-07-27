@@ -2,12 +2,12 @@
 #
 # wytchr local dev stack, supervised by pitchfork (https://pitchfork.jdx.dev).
 #
-# Two daemons: a throwaway Postgres in Docker, and the Quart app run natively
-# via uv with hot-restart on source changes. This is DEV ONLY — production is
-# the container in homelab/compose/wytchr against Aiven PG. Nothing here talks
-# to Aiven or to the prod DB.
+# Three daemons: a throwaway Postgres and a throwaway Valkey, both in Docker,
+# plus the Quart app run natively via uv with hot-restart on source changes.
+# This is DEV ONLY — production is the container in homelab/compose/wytchr
+# against Aiven PG. Nothing here talks to Aiven or to the prod DB.
 #
-#   pitchfork start --group wytchr    # bring the whole stack up
+#   pitchfork start --group wytchr    # bring the whole stack up (PG + Valkey, then web)
 #   pitchfork logs -f web             # tail the app
 #   pitchfork stop  --group wytchr    # tear it down
 #
@@ -26,6 +26,16 @@ run = "exec docker run --rm --name wytchr-dev-pg -e POSTGRES_USER=wytchr -e POST
 ready_cmd = "docker exec wytchr-dev-pg pg_isready -U wytchr -d wytchr"
 stop_signal = { signal = "SIGINT", timeout = "10s" }  # PG fast-shutdown on SIGINT
 
+# ── Local dev Valkey (board read cache) ─────────────────────────────────────
+# The app requires VALKEY_URL, so this is a hard dependency of `web`, not an
+# opt-in. Host port 6380 keeps it clear of any system redis/valkey on 6379.
+# No volume and no persistence: every key is derived from Postgres, so a
+# restart just re-warms on the next board render. Blow it away with
+# `docker rm -f wytchr-dev-valkey` any time.
+[daemons.valkey]
+run = "exec docker run --rm --name wytchr-dev-valkey -p 6380:6379 valkey/valkey:8-alpine valkey-server --save '' --appendonly no"
+ready_cmd = "docker exec wytchr-dev-valkey valkey-cli ping"
+
 # ── wytchr app (Quart + hypercorn) ──────────────────────────────────────────
 # uv assembles an ephemeral env from the Dockerfile's pinned deps (no lockfile
 # in the repo yet) and runs hypercorn, same server as prod. Binds 5050 so it
@@ -33,16 +43,16 @@ stop_signal = { signal = "SIGINT", timeout = "10s" }  # PG fast-shutdown on SIGI
 # any .py or template edit — that's your dev loop.
 #
 # Secrets: the run line sources ./.env (gitignored) for YOUTUBE_API_KEY,
-# API_TOKEN, POLL_*. DATABASE_URL below points at the local dev PG and is NOT
-# in .env, so sourcing .env never clobbers it. Copy .env.example -> .env and
-# fill YOUTUBE_API_KEY before first start.
+# API_TOKEN, POLL_*. DATABASE_URL and VALKEY_URL below point at the local dev
+# containers and are NOT in .env, so sourcing .env never clobbers them. Copy
+# .env.example -> .env and fill YOUTUBE_API_KEY before first start.
 [daemons.web]
-run = "set -a; [ -f .env ] && . ./.env; set +a; exec uv run --python 3.13 --with 'quart==0.20.*' --with 'hypercorn==0.17.*' --with 'apscheduler==3.*' --with 'httpx==0.28.*' --with 'psycopg[binary]==3.*' hypercorn app:app --bind 127.0.0.1:5050 --workers 1 --access-logfile -"
-depends = ["postgres"]
+run = "set -a; [ -f .env ] && . ./.env; set +a; exec uv run --python 3.13 --with 'quart==0.20.*' --with 'hypercorn==0.17.*' --with 'apscheduler==3.*' --with 'httpx==0.28.*' --with 'psycopg[binary]==3.*' --with 'valkey==6.*' hypercorn app:app --bind 127.0.0.1:5050 --workers 1 --access-logfile -"
+depends = ["postgres", "valkey"]
 ready_port = 5050
 watch = ["*.py", "templates/**/*.html"]
 retry = 3
-env = { DATABASE_URL = "postgres://wytchr:wytchr@127.0.0.1:5433/wytchr" }
+env = { DATABASE_URL = "postgres://wytchr:wytchr@127.0.0.1:5433/wytchr", VALKEY_URL = "redis://127.0.0.1:6380/0" }
 # Uncomment to auto-start on `cd` into this repo and auto-stop on leave.
 # Requires the pitchfork shell hook (see DEVELOPING.md). Off by default so a
 # plain `cd` doesn't spin up a Docker Postgres unexpectedly.
@@ -50,4 +60,4 @@ env = { DATABASE_URL = "postgres://wytchr:wytchr@127.0.0.1:5433/wytchr" }
 
 # ── Batch handle for the whole stack ────────────────────────────────────────
 [groups.wytchr]
-daemons = ["postgres", "web"]
+daemons = ["postgres", "valkey", "web"]
