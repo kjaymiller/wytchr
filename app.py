@@ -38,7 +38,7 @@ from quart import (
     request,
 )
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 # YouTube Data API v3 key. Required — drives channel resolution, the
@@ -899,6 +899,11 @@ async def board_partial():
         ).fetchall()
         counts = {row["status"]: row["n"] for row in count_rows}
         actionable = counts.get("new", 0)
+        if title_inc_re or title_exc_re:
+            # SQL can't see the title regexes, so the raw 'new' count would
+            # promise more than the column shows — and the bulk-action
+            # confirm copy reads off this number. Recount the hard way.
+            actionable = len(await _actionable_video_ids(db, ch["name"], cs))
 
         window_clause = ""
         window_args: tuple = ()
@@ -964,6 +969,11 @@ async def board_partial():
                 kept.append(v)
             videos = kept
 
+        # A channel with nothing left after filtering is just scroll
+        # distance — drop the column entirely.
+        if not videos:
+            continue
+
         ch_dict = dict(ch)
         ch_dict["display_name"] = cs["display_name"] or ch["name"]
         ch_dict["feed_url"] = _feed_url_from_channel_url(ch["url"])
@@ -990,10 +1000,8 @@ async def board_partial():
             sections.append({"profile": profile_name, "columns": []})
         sections[section_idx[profile_name]]["columns"].append(col)
     sections.sort(key=lambda s: (s["profile"] == "", s["profile"].lower()))
-    for section in sections:
-        section["columns"].sort(key=lambda c: 0 if c["videos"] else 1)
-    if tag_filter_name:
-        sections = [s for s in sections if s["columns"]]
+    # Sections are built from non-empty columns only, so a profile with
+    # nothing to show never gets created in the first place.
 
     all_video_ids = [v["video_id"] for col in columns for v in col["videos"]]
     video_tags_map = await _video_tags_map(db, all_video_ids)
@@ -1017,18 +1025,16 @@ async def board_partial():
             "channel_count": t["channel_count"],
         })
 
-    totals = {
-        "channels": len(channels),
-        "videos": sum(sum(c["counts"].values()) for c in columns),
-        "new": sum(c["counts"].get("new", 0) for c in columns),
-        "watched": sum(c["counts"].get("watched", 0) for c in columns),
-    }
+    # No board-wide totals: they were summed from the rendered columns,
+    # which no longer include the channels we drop for being empty.
+    # Roster-wide counts live on the channels manage page, which counts
+    # in Postgres instead of guessing from a filtered view.
     return await render_template(
         "_board.html",
         columns=columns,
         sections=sections,
         show_hidden=show_hidden,
-        totals=totals,
+        has_channels=bool(channels),
         video_tags_map=video_tags_map,
         channel_tags_map=channel_tags_map,
         all_tags=all_tags,
@@ -1498,32 +1504,92 @@ async def watched_video(video_id: str):
     return jsonify({"ok": True})
 
 
-@app.post("/channels/<channel_name>/mark-watched")
-@auth_required
-async def mark_channel_watched(channel_name: str):
-    """Bulk-flip every actionable video in the channel to 'watched'."""
+async def _actionable_video_ids(
+    db: AsyncPgConn, channel_name: str, cs: dict | None = None
+) -> list[str]:
+    """The 'new' videos of a channel the board would actually show.
+
+    Bulk actions must not touch videos the operator never saw, so the
+    per-channel filters apply here too: shorts as a SQL clause, the
+    title include/exclude regexes in Python (same as board_partial).
+    Callers that already have the channel's settings row pass it in."""
+    if cs is None:
+        cs = (await _channel_settings_map(db)).get(channel_name, _CHANNEL_SETTINGS_DEFAULTS)
+    shorts_clause = "" if cs["include_shorts"] else " AND url NOT LIKE '%/shorts/%'"
+    rows = await db.execute(
+        f"SELECT video_id, title FROM videos "
+        f"WHERE channel_name = ? AND status = 'new'{shorts_clause}",
+        (channel_name,),
+    ).fetchall()
+    title_inc_re = _compile_title_re(cs["title_include"])
+    title_exc_re = _compile_title_re(cs["title_exclude"])
+    ids = []
+    for r in rows:
+        title = r["title"] or ""
+        if title_inc_re and not title_inc_re.search(title):
+            continue
+        if title_exc_re and title_exc_re.search(title):
+            continue
+        ids.append(r["video_id"])
+    return ids
+
+
+async def _bulk_channel_action(channel_name: str, action: str):
+    """Shared body of watch-all / skip-all.
+
+    'watch' archives what the operator engaged with (watched_at set);
+    'skip' is the dismissal pile — status_changed_at only, watched_at
+    left NULL so the auto_mark_watched sweep never reads a skip as a
+    view. Both stay reversible through ?hidden=1 / unhide."""
     db = await get_db()
     if not await db.execute("SELECT 1 FROM channels WHERE name = ?", (channel_name,)).fetchone():
         return ("channel not found", 404)
+    video_ids = await _actionable_video_ids(db, channel_name)
     now = int(time.time())
-    cur = await db.execute(
-        """UPDATE videos
-              SET status = 'watched', status_changed_at = ?,
-                  watched_at = COALESCE(watched_at, ?)
-            WHERE channel_name = ?
-              AND status = 'new'""",
-        (now, now, channel_name),
-    )
+    marked = 0
+    if video_ids:
+        placeholders = ",".join("?" * len(video_ids))
+        if action == "watch":
+            cur = await db.execute(
+                f"""UPDATE videos
+                      SET status = 'watched', status_changed_at = ?,
+                          watched_at = COALESCE(watched_at, ?)
+                    WHERE video_id IN ({placeholders})""",
+                (now, now, *video_ids),
+            )
+        else:
+            cur = await db.execute(
+                f"""UPDATE videos
+                      SET status = 'hidden', status_changed_at = ?
+                    WHERE video_id IN ({placeholders})""",
+                (now, *video_ids),
+            )
+        marked = cur.rowcount or 0
     await db.commit()
-    marked = cur.rowcount or 0
     if request.headers.get("HX-Request"):
         body = await board_partial()
         resp = await make_response(body)
         resp.headers["HX-Trigger"] = json.dumps({
-            "wytchr:channel-watched": {"channel": channel_name, "marked": marked}
+            "wytchr:channel-bulk": {
+                "channel": channel_name, "action": action, "marked": marked
+            }
         })
         return resp
-    return jsonify({"ok": True, "marked": marked})
+    return jsonify({"ok": True, "action": action, "marked": marked})
+
+
+@app.post("/channels/<channel_name>/watch-all")
+@auth_required
+async def watch_channel_all(channel_name: str):
+    """Bulk-flip every actionable video in the channel to 'watched'."""
+    return await _bulk_channel_action(channel_name, "watch")
+
+
+@app.post("/channels/<channel_name>/skip-all")
+@auth_required
+async def skip_channel_all(channel_name: str):
+    """Bulk-dismiss every actionable video in the channel to 'hidden'."""
+    return await _bulk_channel_action(channel_name, "skip")
 
 
 @app.post("/videos/<video_id>/unhide")
