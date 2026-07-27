@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>wytchr · channels</title>
+  <style>
+    :root { color-scheme: dark; }
+    body, body[data-theme="licorice"] { --bg:#0a060d; --card:#15101a; --line:#2d2238; --fg:#f3e9e6; --muted:#8a7d8a; --accent:#ff5f87; --accent-ink:#1a0a14; --danger:#f25b5b; --ok:#b8e0a3; }
+    body[data-theme="marmite"] { --bg:#14100a; --card:#221a10; --line:#3d2f1d; --fg:#f7e7a8; --muted:#a89568; --accent:#f5c518; --accent-ink:#1a1208; --danger:#d63d3d; --ok:#9bc053; }
+    body[data-theme="sees"] { --bg:#14100c; --card:#221a14; --line:#3d2e22; --fg:#f5ebe0; --muted:#a89578; --accent:#d4a574; --accent-ink:#14100c; --danger:#c84545; --ok:#9aae6a; }
+    body[data-theme="jaffa"] { --bg:#1c0e04; --card:#2c1808; --line:#4c3018; --fg:#f5d8a8; --muted:#a8835a; --accent:#f97316; --accent-ink:#1c0e04; --danger:#d63d3d; --ok:#a8be58; }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; }
+    header { display: flex; align-items: center; gap: 1.25rem; padding: .75rem 1rem; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; padding-right: .75rem; border-right: 1px solid var(--line); }
+    header a { color: var(--muted); text-decoration: none; font-size: .85rem; }
+    header a:hover { color: var(--accent); }
+    main { max-width: 64rem; padding: 1rem; margin: 0 auto; }
+    .hint { color: var(--muted); font-size: .8rem; margin: 0 0 1rem; }
+    /* Same summary line the board header used to carry, before its
+       columns moved behind a cache and stopped being able to total. */
+    .stats { display: flex; flex-wrap: wrap; gap: 0 1.25rem; padding: 0 .25rem 1rem; color: var(--muted); font-size: .85rem; align-items: baseline; }
+    .stats strong { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .stats .hot strong { color: var(--accent); }
+    .stats .bad strong { color: var(--danger); }
+    .stats .muted strong { color: var(--muted); }
+
+    .controls { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin-bottom: 1rem; }
+    .controls input, .controls select {
+      background: var(--card); color: var(--fg);
+      border: 1px solid var(--line); border-radius: 4px;
+      padding: .35rem .55rem; font: inherit; font-size: .85rem;
+    }
+    .controls input { flex: 1; min-width: 12rem; }
+    .controls input::placeholder { color: var(--muted); }
+    .controls input:focus, .controls select:focus, .controls input:hover, .controls select:hover { outline: none; border-color: var(--accent); }
+
+    .roster { background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+    .ch { display: grid; grid-template-columns: minmax(12rem, 1fr) auto auto; gap: .35rem .9rem; align-items: baseline; padding: .6rem .8rem; border-top: 1px solid var(--line); }
+    .ch:first-child { border-top: 0; }
+    .ch[hidden] { display: none; }
+    .ch[data-hidden="1"] { opacity: .55; }
+    .ch .name { font-weight: 600; }
+    .ch .real { color: var(--muted); font-size: .78rem; font-family: ui-monospace, monospace; }
+    .ch .profile { color: var(--accent); font-size: .75rem; font-family: ui-monospace, monospace; }
+    .ch .profile.none { color: var(--muted); font-style: italic; font-family: inherit; }
+    .ch a.src { color: var(--muted); font-size: .75rem; text-decoration: none; }
+    .ch a.src:hover { color: var(--accent); text-decoration: underline; }
+    .ch .counts { color: var(--muted); font-size: .8rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .ch .counts b { color: var(--fg); font-weight: 600; }
+    .ch .counts b.hot { color: var(--accent); }
+    .ch .settings { color: var(--muted); font-size: .8rem; text-decoration: none; border: 1px solid var(--line); border-radius: 4px; padding: .2rem .55rem; white-space: nowrap; }
+    .ch .settings:hover { color: var(--fg); border-color: var(--accent); }
+    .ch .meta { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 0 .75rem; color: var(--muted); font-size: .75rem; }
+    .ch .flag { border: 1px solid var(--line); border-radius: 3px; padding: 0 .3rem; }
+    .ch .err { grid-column: 1 / -1; color: var(--danger); font-size: .75rem; word-break: break-word; }
+    .empty-state { color: var(--muted); padding: 2rem; text-align: center; }
+    #no-matches { display: none; }
+    #no-matches[data-shown="1"] { display: block; }
+  </style>
+</head>
+<body data-theme="licorice">
+  <script>
+    try { const t = localStorage.getItem('wytchr.theme'); if (t) document.body.setAttribute('data-theme', t); } catch (e) {}
+  </script>
+  <header>
+    <h1>wytchr · channels</h1>
+    <a href="/">← back to board</a>
+    <a href="/channels/add">add channel</a>
+    <a href="/tags">tags</a>
+    <a href="/favorites">favorites</a>
+    <a href="/webhooks">webhooks</a>
+  </header>
+  <main>
+    <p class="hint">
+      Every subscribed channel, including the quiet ones the board leaves out.
+      Counts are per video status and follow each channel's shorts setting.
+    </p>
+    <div class="stats">
+      <span><strong>{{ totals.channels }}</strong> channels</span>
+      <span><strong>{{ totals.videos }}</strong> videos</span>
+      <span class="hot"><strong>{{ totals.new }}</strong> new</span>
+      <span class="muted"><strong>{{ totals.watched }}</strong> watched</span>
+      {% if totals.hidden_channels %}<span class="muted"><strong>{{ totals.hidden_channels }}</strong> hidden from board</span>{% endif %}
+      {% if totals.erroring %}<span class="bad"><strong>{{ totals.erroring }}</strong> failing to poll</span>{% endif %}
+    </div>
+
+    {% if channels %}
+      <div class="controls">
+        <input id="channel-search" type="search" placeholder="search channels…"
+               aria-label="filter channels by name or profile (fuzzy)"
+               autocomplete="off" spellcheck="false">
+        <select id="channel-sort" aria-label="sort channels">
+          <option value="name">sort: name</option>
+          <option value="profile">sort: profile</option>
+          <option value="new">sort: new videos</option>
+          <option value="polled">sort: last polled</option>
+        </select>
+      </div>
+      <div class="roster" id="roster">
+        {% for ch in channels %}
+          <div class="ch" data-hidden="{{ ch.hide_channel }}"
+               data-search="{{ (ch.display_name ~ ' ' ~ ch.name ~ ' ' ~ ch.preset)|lower }}"
+               data-name="{{ ch.display_name|lower }}"
+               data-profile="{{ ch.preset|lower }}"
+               data-new="{{ ch.new }}"
+               data-polled="{{ ch.last_polled_at }}">
+            <div>
+              <span class="name">{{ ch.display_name }}</span>
+              {% if ch.aliased %}<span class="real">{{ ch.name }}</span>{% endif %}
+              {% if ch.preset %}
+                <span class="profile">{{ ch.preset }}</span>
+              {% else %}
+                <span class="profile none">(no profile)</span>
+              {% endif %}
+              <a class="src" href="{{ ch.url }}" target="_blank" rel="noopener">youtube ↗</a>
+            </div>
+            <div class="counts">
+              <b class="{{ 'hot' if ch.new else '' }}">{{ ch.new }}</b> new ·
+              <b>{{ ch.watched }}</b> watched ·
+              <b>{{ ch.hidden }}</b> hidden
+            </div>
+            <a class="settings" href="/channels/{{ ch.name }}/settings">settings</a>
+            <div class="meta">
+              <span>polled {{ ch.last_polled }}</span>
+              {% if ch.hide_channel %}<span class="flag">hidden from board</span>{% endif %}
+              {% if ch.auto_watched_days %}<span class="flag">auto-watched after {{ ch.auto_watched_days }}d</span>{% endif %}
+              {% if ch.include_shorts %}<span class="flag">shorts included</span>{% endif %}
+            </div>
+            {% if ch.last_error %}
+              <div class="err">last poll failed: {{ ch.last_error }}</div>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+      <div class="empty-state" id="no-matches">No channels match that search.</div>
+    {% else %}
+      <div class="empty-state">No channels yet. <a href="/channels/add">Add one</a>.</div>
+    {% endif %}
+  </main>
+  <script>
+    // Fuzzy filter + sort over the roster. Same subsequence match the
+    // board's #channel-search uses, but the haystack is display name +
+    // real name + profile so "mus" finds the music profile too.
+    (function() {
+      const input = document.getElementById('channel-search');
+      const sort = document.getElementById('channel-sort');
+      const roster = document.getElementById('roster');
+      if (!input || !roster) return;
+      const rows = Array.from(roster.querySelectorAll('.ch'));
+      const noMatches = document.getElementById('no-matches');
+      function fuzzy(query, target) {
+        if (!query) return true;
+        let i = 0;
+        for (let j = 0; j < target.length && i < query.length; j++) {
+          if (target.charCodeAt(j) === query.charCodeAt(i)) i++;
+        }
+        return i === query.length;
+      }
+      function applyFilter() {
+        const q = (input.value || '').trim().toLowerCase();
+        let any = false;
+        rows.forEach((row) => {
+          const match = fuzzy(q, row.dataset.search || '');
+          row.hidden = !match;
+          if (match) any = true;
+        });
+        noMatches.setAttribute('data-shown', any ? '0' : '1');
+      }
+      function applySort() {
+        const mode = sort.value;
+        const sorted = rows.slice().sort((a, b) => {
+          if (mode === 'new') return (+b.dataset.new) - (+a.dataset.new);
+          // Never-polled sorts last rather than first: 0 means "no idea".
+          if (mode === 'polled') return (+b.dataset.polled || -Infinity) - (+a.dataset.polled || -Infinity);
+          if (mode === 'profile') {
+            const cmp = (a.dataset.profile || '￿').localeCompare(b.dataset.profile || '￿');
+            if (cmp) return cmp;
+          }
+          return a.dataset.name.localeCompare(b.dataset.name);
+        });
+        sorted.forEach((row) => roster.appendChild(row));
+      }
+      input.addEventListener('input', applyFilter);
+      sort.addEventListener('change', applySort);
+    })();
+  </script>
+  <div style="position: fixed; bottom: .5rem; right: .75rem; color: #6a5f6a; font-size: .7rem;">v{{ app_version }}</div>
+</body>
+</html>
