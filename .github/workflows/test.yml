@@ -1,0 +1,62 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+
+    services:
+      # The app is Postgres-only — the SQL shim rewrites SQLite-flavoured
+      # SQL on the way out, so testing against anything else tests the
+      # wrong thing.
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: wytchr
+          POSTGRES_PASSWORD: wytchr
+          POSTGRES_DB: wytchr
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U wytchr -d wytchr"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+
+      # Unused on revisions that predate the board cache; required once
+      # it lands. Starting it unconditionally keeps this workflow working
+      # on both sides of that change.
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Run tests
+        env:
+          DATABASE_URL: postgres://wytchr:wytchr@127.0.0.1:5432/wytchr
+          VALKEY_URL: redis://127.0.0.1:6379/0
+          API_TOKEN: test-token
+        run: |
+          uv run --python 3.13 \
+            --with 'quart==0.20.*' \
+            --with 'apscheduler==3.*' \
+            --with 'httpx==0.28.*' \
+            --with 'psycopg[binary]==3.*' \
+            --with 'valkey==6.*' \
+            --with pytest --with pytest-asyncio \
+            pytest -q
