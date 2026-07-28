@@ -7,7 +7,8 @@ RUN uv pip install --system --no-cache \
     "hypercorn==0.17.*" \
     "apscheduler==3.*" \
     "httpx==0.28.*" \
-    "psycopg[binary]==3.*"
+    "psycopg[binary]==3.*" \
+    "valkey==6.*"
 
 WORKDIR /app
 COPY *.py /app/

@@ -15,6 +15,16 @@ services:
       timeout: 3s
       retries: 30
 
+  valkey:
+    image: valkey/valkey:8-alpine
+    # Pure cache, same as prod: no persistence, nothing to clean up.
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
   wytchr:
     build:
       context: ..
@@ -22,12 +32,16 @@ services:
     depends_on:
       pg:
         condition: service_healthy
+      valkey:
+        condition: service_healthy
     environment:
       - API_TOKEN=test-token
       # Placeholder — outbound YouTube API calls won't succeed in tests
       # without a real key. Boot / DB / form rendering still exercise.
       - YOUTUBE_API_KEY=${YOUTUBE_API_KEY:-fake-test-key}
       - DATABASE_URL=postgresql://wytchr:wytchr@pg:5432/wytchr
+      # Required — the app exits at import without it.
+      - VALKEY_URL=redis://valkey:6379/0
       - POLL_INTERVAL_MINUTES=60
     ports:
       - "5050:5000"

@@ -3,8 +3,8 @@
 The production deploy is the container in `homelab/compose/wytchr/` against Aiven
 Postgres. For local iteration you don't want to touch either — so this repo ships
 a [`pitchfork.toml`](./pitchfork.toml) that runs the whole stack on your machine:
-a throwaway Postgres in Docker plus the Quart app run natively via `uv`, with
-hot-restart on every source edit.
+a throwaway Postgres and a throwaway Valkey in Docker, plus the Quart app run
+natively via `uv`, with hot-restart on every source edit.
 
 [pitchfork](https://pitchfork.jdx.dev) is jdx's process supervisor (same author
 as mise, which this repo already uses).
@@ -20,8 +20,11 @@ cp .env.example .env
 $EDITOR .env                        # set YOUTUBE_API_KEY=...  (API_TOKEN too)
 ```
 
-`.env` is gitignored. `DATABASE_URL` is **not** set there — the dev DB URL lives
-in `pitchfork.toml` and points at the local Postgres, so the two never fight.
+`.env` is gitignored. `DATABASE_URL` and `VALKEY_URL` are **not** set there — the
+dev URLs live in `pitchfork.toml` and point at the local Postgres and Valkey, so
+the two never fight. Both are required by the app (it exits at startup without
+them), but `pitchfork start --group wytchr` supplies both, so there is no extra
+setup step.
 
 > Secrets never go in `pitchfork.toml` (it's committed). They stay in `.env`,
 > which the app's `run` line sources at start. If you'd rather use pitchfork's
@@ -31,7 +34,7 @@ in `pitchfork.toml` and points at the local Postgres, so the two never fight.
 ## Daily loop
 
 ```bash
-pitchfork start --group wytchr      # postgres first, then web once PG is ready
+pitchfork start --group wytchr      # postgres + valkey first, then web once both are ready
 pitchfork logs -f web               # tail the app (Ctrl-C just detaches)
 ```
 
@@ -45,13 +48,19 @@ pitchfork stop --group wytchr       # tear the whole stack down
 
 ## The daemons
 
-| Daemon     | What it is                        | Port / check                     |
-|------------|-----------------------------------|----------------------------------|
-| `postgres` | `postgres:18-alpine` in Docker    | host `5433`, `pg_isready` gate   |
-| `web`      | `hypercorn app:app` via `uv run`  | `127.0.0.1:5050`, TCP ready-port |
+| Daemon     | What it is                        | Port / check                      |
+|------------|-----------------------------------|-----------------------------------|
+| `postgres` | `postgres:18-alpine` in Docker    | host `5433`, `pg_isready` gate    |
+| `valkey`   | `valkey/valkey:8-alpine` in Docker| host `6380`, `valkey-cli ping` gate |
+| `web`      | `hypercorn app:app` via `uv run`  | `127.0.0.1:5050`, TCP ready-port  |
 
-- **`depends`** — `web` waits for `postgres` to pass its readiness check before
-  starting, so you never hit a "connection refused" on boot.
+- **`depends`** — `web` waits for *both* `postgres` and `valkey` to pass their
+  readiness checks before starting, so you never hit a "connection refused" on
+  boot. Valkey is mandatory, not optional: the app backs the board's per-channel
+  queries with it and exits at startup if `VALKEY_URL` is unset.
+- **Cache data is disposable** — no volume, no persistence. Every key is derived
+  from Postgres and re-warms on the next board render, so restarting or deleting
+  the container costs nothing but a few queries.
 - **Schema** — the app's `init_db()` runs `CREATE TABLE IF NOT EXISTS` for every
   table, so a fresh volume needs no migration step.
 - **Deps** — `uv run --with ...` mirrors the pinned versions in the `Dockerfile`.
@@ -88,11 +97,14 @@ it tears it down. Left off by default so a stray `cd` doesn't spin up Docker.
 
 - **`web` won't start / auth errors** — `YOUTUBE_API_KEY` missing from `.env`.
   The app fails fast without it. `pitchfork logs web` shows the reason.
-- **Port 5433 or 5050 in use** — something else is bound. Change the ports in
-  `pitchfork.toml` (`-p 5433:5432` and the `--bind` / `ready_port`), keeping the
-  `DATABASE_URL` port in sync.
-- **Stale `wytchr-dev-pg` container after a crash** — `docker rm -f wytchr-dev-pg`,
-  then start again.
+- **Port 5433, 6380 or 5050 in use** — something else is bound. Change the ports
+  in `pitchfork.toml` (`-p 5433:5432`, `-p 6380:6379`, and the `--bind` /
+  `ready_port`), keeping the `DATABASE_URL` / `VALKEY_URL` ports in sync.
+- **Stale `wytchr-dev-pg` / `wytchr-dev-valkey` container after a crash** —
+  `docker rm -f wytchr-dev-pg wytchr-dev-valkey`, then start again.
+- **Board showing stale columns** — an invalidation was missed somewhere. Every
+  entry has a TTL so it self-heals, but `docker exec wytchr-dev-valkey valkey-cli
+  flushall` clears it immediately.
 - **`pitchfork` not found** — `mise use -g aqua:jdx/pitchfork`, or ensure mise
   shims are on `PATH` (`eval "$(mise activate zsh)"`).
 

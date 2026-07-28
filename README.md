@@ -28,6 +28,7 @@ docker run --rm -p 5000:5000 \
 | `YTDL_SUB_API_URL` | `http://ytdl-sub-api:5000` | upstream ytdl-sub-api base |
 | `YTDL_SUB_API_TOKEN` | `$API_TOKEN` | bearer for ytdl-sub-api |
 | `DB_PATH` | `/data/wytchr.db` | SQLite path |
+| `VALKEY_URL` | `redis://valkey:6379/0` | required; board read cache. `compose.yml` ships a `valkey` service and points this at it, so there's nothing to provision — override only for an external instance. Running outside compose, you must set it: the app exits at startup without one. |
 | `POLL_INTERVAL_MINUTES` | `30` | channel poll cadence |
 | `POLL_LIMIT` | `30` | entries per channel per poll |
 

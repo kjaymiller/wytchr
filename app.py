@@ -13,6 +13,7 @@ window."
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -24,6 +25,7 @@ from urllib.parse import urlencode
 
 import httpx
 import psycopg
+import valkey.asyncio as valkey
 from psycopg.rows import dict_row
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -38,13 +40,18 @@ from quart import (
     request,
 )
 
-__version__ = "0.17.0"
+__version__ = "0.18.0"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 # YouTube Data API v3 key. Required — drives channel resolution, the
 # poll loop, and description enrichment.
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+# Valkey connection URI for the per-channel board read cache. Required —
+# see the "Board read cache" section. `valkey://host:port/db` (or the
+# `redis://` alias valkey-py also accepts); `valkeys://`/`rediss://` for
+# TLS. compose.yml defaults it to the sibling valkey service.
+VALKEY_URL = os.environ.get("VALKEY_URL", "").strip()
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "30"))
 POLL_LIMIT = int(os.environ.get("POLL_LIMIT", "30"))
 
@@ -54,6 +61,10 @@ if not API_TOKEN:
 
 if not DATABASE_URL:
     print("FATAL: DATABASE_URL env var must be set (Postgres URI from install.sh)", file=sys.stderr)
+    sys.exit(1)
+
+if not VALKEY_URL:
+    print("FATAL: VALKEY_URL env var must be set (Valkey URI for the board read cache)", file=sys.stderr)
     sys.exit(1)
 
 if not YOUTUBE_API_KEY:
@@ -80,12 +91,13 @@ if not re.fullmatch(r"AIza[0-9A-Za-z_-]{35}", YOUTUBE_API_KEY):
 
 app = Quart(__name__)
 
-# Process-wide singletons. Both are created in @app.before_serving so
-# they bind to the running event loop, and torn down in
-# @app.after_serving. Anywhere outside a request that needs HTTP or
-# the scheduler should reach for these.
+# Process-wide singletons. All three are created in @app.before_serving
+# so they bind to the running event loop, and torn down in
+# @app.after_serving. Anywhere outside a request that needs HTTP, the
+# cache, or the scheduler should reach for these.
 _http_client: httpx.AsyncClient | None = None
 _scheduler: AsyncIOScheduler | None = None
+_valkey: valkey.Valkey | None = None
 
 
 @app.context_processor
@@ -504,6 +516,263 @@ async def _channel_tags_map(db: AsyncPgConn, names: list[str]) -> dict[str, list
     return out
 
 
+# --- Board read cache (Valkey) ----------------------------------------
+#
+# Every board render runs two queries *per channel* — a `GROUP BY status`
+# count and a windowed video select — and the board auto-refreshes every
+# 30s per client on top of a full re-render after every bulk action. With
+# N channels that's 2N round-trips to Aiven PG on a 30-second cadence for
+# data that only moves when a poll lands or the operator clicks something.
+# Valkey sits in front of the per-channel slice (see _channel_slice) and
+# absorbs the repeats.
+#
+# What's cached: the structured rows (`videos` / `counts` / `actionable`),
+# not the rendered HTML. The column's *markup* depends on more than its
+# query does — show_hidden, the active tag (every chip href embeds it),
+# and the per-video/per-channel tag chips that come from board-wide
+# batched lookups — so caching HTML would either multiply the key space
+# by every template-affecting flag or serve wrong markup. Rows keep the
+# key space sane and leave the template free to change; only a change to
+# the *selected columns* needs the schema version below bumped.
+#
+# Failure policy: boot-required, runtime-forgiving. A missing VALKEY_URL
+# is fatal at import (above), but a Valkey error mid-request degrades to
+# Postgres rather than 500ing — see _cache_degrade.
+
+# Key: wytchr:slice:<schema>:<channel>:<view_hash>. Bump the schema
+# segment when the cached payload's *shape* changes (new selected column,
+# renamed field); every old entry is then simply never read again and
+# ages out on its own TTL, so a rollout needs no manual flush.
+CACHE_SCHEMA = "v1"
+CACHE_PREFIX = f"wytchr:slice:{CACHE_SCHEMA}"
+
+# Socket timeouts are deliberately tight. The cache exists to *save*
+# time; a Valkey that takes longer to answer than Postgres would is worse
+# than no cache, so we give up fast and read through.
+CACHE_SOCKET_TIMEOUT = 1.0
+
+_cache_last_warn = 0.0
+
+
+def _cache_degrade(op: str, exc: Exception) -> None:
+    """Single choke point for every runtime cache failure.
+
+    Everything in the cache is derived from Postgres and there is no
+    write-back, so a Valkey error is indistinguishable from a cache miss
+    to the caller — reading through is always correct, just slower.
+    Failing the request instead would turn a cache blip into a total
+    outage, and would fail the *write* routes (which call
+    _invalidate_channel after the commit already landed) for no
+    correctness gain.
+
+    To flip to fully-required semantics, `raise exc` here — no call site
+    changes.
+
+    Warnings are rate-limited to one per minute so a sustained outage
+    doesn't drown the log at the board's 30s refresh cadence.
+    """
+    global _cache_last_warn
+    now = time.monotonic()
+    if now - _cache_last_warn < 60:
+        return
+    _cache_last_warn = now
+    print(
+        f"WARNING: board cache unavailable ({op}: {exc}) — reading through to "
+        "Postgres. Further cache warnings suppressed for 60s.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _cache() -> valkey.Valkey | None:
+    """Return the process-wide Valkey client. None before before_serving
+    has run (scripts, imports) — callers treat that as a miss."""
+    return _valkey
+
+
+# TTL bounds. The floor keeps a badly-clocked last_polled_at from
+# producing a 1-second TTL that makes the cache pure overhead; the
+# ceiling caps how stale a very quiet channel can get if every explicit
+# invalidation somehow missed.
+CACHE_TTL_MIN = 15
+CACHE_TTL_MAX = 3600
+CACHE_TTL_POLL_DUE = 30
+
+
+def _slice_ttl(last_polled_at: int | None, cs: dict, now: int | None = None) -> int:
+    """Per-channel TTL, derived from that channel's own rules.
+
+    A global constant would be wrong in both directions: a channel polled
+    every 30 minutes doesn't need a 60-second TTL, and a channel whose
+    poll is overdue shouldn't hold a stale slice for half an hour. The
+    formula:
+
+        ttl = (last_polled_at + POLL_INTERVAL_MINUTES * 60) - now
+            → seconds until the next poll is expected to land, which is
+              the next moment this channel's videos can change on their
+              own. This is the upper bound the issue asks for.
+
+        ttl <= 0            → CACHE_TTL_POLL_DUE (30s). Never polled, or
+                              the poll is due/overdue: a write is
+                              imminent, so stay short.
+
+        hide_channel        → max(ttl, CACHE_TTL_MAX). A hidden channel
+                              isn't on the default board at all; only an
+                              explicit unhide changes what it shows, and
+                              that path invalidates.
+
+        auto_watched_days   → min(ttl, 3600). auto_mark_watched() runs
+                              hourly and only touches channels with a
+                              window set. It invalidates what it marks,
+                              but capping at one sweep period means a
+                              missed invalidation self-heals within one
+                              sweep instead of riding to the ceiling.
+
+        clamped to [CACHE_TTL_MIN, CACHE_TTL_MAX].
+
+    The shorts/title filters are the *other* channel rules the issue
+    names; they don't move the TTL because they're folded into the key
+    instead (see _slice_key) — editing them changes the hash, so the old
+    entry is never read again rather than needing to expire.
+    """
+    if now is None:
+        now = int(time.time())
+    ttl = ((last_polled_at or 0) + POLL_INTERVAL_MINUTES * 60) - now
+    if ttl <= 0:
+        ttl = CACHE_TTL_POLL_DUE
+    if cs.get("hide_channel"):
+        ttl = max(ttl, CACHE_TTL_MAX)
+    if cs.get("auto_watched_days"):
+        ttl = min(ttl, 3600)
+    return max(CACHE_TTL_MIN, min(ttl, CACHE_TTL_MAX))
+
+
+def _slice_key(
+    channel_name: str,
+    cs: dict,
+    *,
+    show_hidden: bool,
+    tag_filter_name: str,
+    limit: int,
+) -> str:
+    """Cache key for one channel's board slice.
+
+    The hash has to discriminate on everything that changes the query
+    result: `show_hidden` (picks the status filter), the tag filter, the
+    row limit, and the channel's own settings — include_shorts and
+    title_include/title_exclude change which rows survive, hide_channel
+    changes whether the column renders at all, display_name rides along
+    in the payload. Putting the settings in the *key* rather than on an
+    invalidation hook means a settings edit can't serve rows filtered by
+    the previous regex: the new hash simply misses.
+
+    Channel names are slugified to [A-Za-z0-9_-] on insert, so they
+    contain no `:` (the delimiter) and no glob metacharacters — which is
+    what makes the SCAN pattern in _invalidate_channel safe.
+    """
+    view = json.dumps(
+        [
+            bool(show_hidden),
+            tag_filter_name or "",
+            int(limit),
+            cs.get("display_name") or "",
+            int(cs.get("include_shorts") or 0),
+            int(cs.get("hide_channel") or 0),
+            cs.get("title_include") or "",
+            cs.get("title_exclude") or "",
+        ],
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(view.encode("utf-8")).hexdigest()[:16]
+    return f"{CACHE_PREFIX}:{channel_name}:{digest}"
+
+
+async def _cache_get(key: str) -> dict | None:
+    client = _cache()
+    if client is None:
+        return None
+    try:
+        raw = await client.get(key)
+    except Exception as exc:  # noqa: BLE001 — any cache error reads through
+        _cache_degrade("get", exc)
+        return None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        # Corrupt or older-shaped entry. Treat as a miss; it'll be
+        # overwritten by the set that follows.
+        return None
+
+
+async def _cache_set(key: str, payload: dict, ttl: int) -> None:
+    client = _cache()
+    if client is None:
+        return
+    try:
+        await client.set(key, json.dumps(payload), ex=ttl)
+    except Exception as exc:  # noqa: BLE001
+        _cache_degrade("set", exc)
+
+
+async def _invalidate_channel(channel_name: str | None) -> None:
+    """Drop every cached slice for one channel.
+
+    TTL is the safety net; this is the correctness mechanism — it runs on
+    every write path that changes what a channel's column shows.
+
+    SCAN rather than a computed key list because the tag filter makes the
+    view dimension open-ended: a write path can't enumerate which views
+    exist. The alternative (a per-channel generation counter folded into
+    the key) would cost an extra round-trip on the *read* path, which is
+    the hot one — the board refreshes every 30s per client while writes
+    are operator clicks.
+    """
+    client = _cache()
+    if client is None or not channel_name:
+        return
+    try:
+        keys = [k async for k in client.scan_iter(match=f"{CACHE_PREFIX}:{channel_name}:*", count=200)]
+        if keys:
+            await client.unlink(*keys)
+    except Exception as exc:  # noqa: BLE001 — a failed invalidation degrades
+        # to TTL-bounded staleness, which is the whole point of having a TTL.
+        _cache_degrade("invalidate", exc)
+
+
+async def _invalidate_all() -> None:
+    """Drop every cached slice. For the tag admin operations (rename with
+    merge, delete) that repoint video_tags across arbitrarily many
+    channels at once — cheaper to reason about than working out the
+    affected set."""
+    client = _cache()
+    if client is None:
+        return
+    try:
+        keys = [k async for k in client.scan_iter(match=f"{CACHE_PREFIX}:*", count=500)]
+        if keys:
+            await client.unlink(*keys)
+    except Exception as exc:  # noqa: BLE001
+        _cache_degrade("invalidate-all", exc)
+
+
+async def _channel_of_video(db: AsyncPgConn, video_id: str) -> str | None:
+    """The per-video routes only know a video id, but cache keys are
+    per-channel — so the invalidating routes need this one extra lookup.
+    channel_name never changes for a given video, so it's equally valid
+    before or after the UPDATE."""
+    row = await db.execute(
+        "SELECT channel_name FROM videos WHERE video_id = ?", (video_id,)
+    ).fetchone()
+    return row["channel_name"] if row else None
+
+
+async def _invalidate_video(db: AsyncPgConn, video_id: str) -> None:
+    """_invalidate_channel for a route that only has a video id."""
+    await _invalidate_channel(await _channel_of_video(db, video_id))
+
+
 # --- Auth -------------------------------------------------------------
 
 def _authed() -> bool:
@@ -748,6 +1017,12 @@ async def _poll_all_impl() -> dict:
                 # Commit per channel so other writers can interleave
                 # instead of waiting for the whole sweep.
                 await db.commit()
+                # Ingest is the main non-operator write path. Invalidate
+                # on every channel the sweep touched, not just the ones
+                # that gained videos: poll_channel always writes
+                # last_polled_at, and last_polled_at is what the TTL is
+                # derived from.
+                await _invalidate_channel(row["name"])
                 summary["new_videos"] += count
                 if err:
                     summary["errors"].append(f"{row['name']}: {err}")
@@ -852,6 +1127,154 @@ async def index():
     )
 
 
+# Rows per channel column. Module-level because _channel_slice keys on
+# it — a change here has to change the cache key too, or the first render
+# after the bump serves the old row count.
+PER_CHANNEL_LIMIT = 20
+
+
+async def _channel_slice(
+    db: AsyncPgConn,
+    ch: dict,
+    cs: dict,
+    *,
+    show_hidden: bool,
+    tag_filter_id: int | None,
+    tag_filter_name: str,
+    limit: int = PER_CHANNEL_LIMIT,
+    use_cache: bool = True,
+) -> dict:
+    """One channel's board slice: {videos, counts, actionable,
+    channel_tag_match}.
+
+    The unit of caching, and the unit of work the board and the manage-
+    channels page share. `use_cache=False` skips both the read and the
+    write and goes straight to Postgres — the manage page is the
+    operator's "what does the DB actually say" view, so a stale
+    management screen would defeat its purpose.
+
+    `channel_tag_match` is only meaningful under a tag filter: it says
+    the *channel* carries the tag, which means the column stays on the
+    board even when it has no matching videos.
+    """
+    key = ""
+    if use_cache:
+        key = _slice_key(
+            ch["name"],
+            cs,
+            show_hidden=show_hidden,
+            tag_filter_name=tag_filter_name,
+            limit=limit,
+        )
+        cached = await _cache_get(key)
+        if cached is not None:
+            return cached
+
+    if show_hidden:
+        status_filter = ("hidden",)
+    else:
+        # wytchr is a selector, not a library view: only show videos
+        # the operator hasn't acted on yet.
+        status_filter = ("new",)
+    status_placeholders = ",".join("?" * len(status_filter))
+
+    shorts_clause = "" if cs["include_shorts"] else " AND v.url NOT LIKE '%/shorts/%'"
+    shorts_clause_count = "" if cs["include_shorts"] else " AND url NOT LIKE '%/shorts/%'"
+    title_inc_re = _compile_title_re(cs["title_include"])
+    title_exc_re = _compile_title_re(cs["title_exclude"])
+
+    count_rows = await db.execute(
+        f"SELECT status, COUNT(*) AS n FROM videos WHERE channel_name = ? {shorts_clause_count} GROUP BY status",
+        (ch["name"],),
+    ).fetchall()
+    counts = {row["status"]: row["n"] for row in count_rows}
+    actionable = counts.get("new", 0)
+    if title_inc_re or title_exc_re:
+        # SQL can't see the title regexes, so the raw 'new' count would
+        # promise more than the column shows — and the bulk-action
+        # confirm copy reads off this number. Recount the hard way.
+        actionable = len(await _actionable_video_ids(db, ch["name"], cs))
+
+    window_clause = ""
+    window_args: tuple = ()
+
+    channel_tag_match = False
+    if tag_filter_id is not None:
+        channel_has_tag = await db.execute(
+            "SELECT 1 FROM channel_tags WHERE channel_name = ? AND tag_id = ?",
+            (ch["name"], tag_filter_id),
+        ).fetchone()
+        channel_tag_match = bool(channel_has_tag)
+        if channel_has_tag:
+            videos = await db.execute(
+                f"""SELECT v.video_id, v.title, v.duration, v.upload_date,
+                           v.thumbnail_url, v.url, v.status, v.favorited_at,
+                           v.description
+                      FROM videos v
+                     WHERE v.channel_name = ?
+                       AND v.status IN ({status_placeholders})
+                       {shorts_clause}
+                       {window_clause}
+                  ORDER BY v.upload_date DESC NULLS LAST, v.seen_at DESC
+                     LIMIT ?""",
+                (ch["name"], *status_filter, *window_args, limit),
+            ).fetchall()
+        else:
+            videos = await db.execute(
+                f"""SELECT v.video_id, v.title, v.duration, v.upload_date,
+                           v.thumbnail_url, v.url, v.status, v.favorited_at,
+                           v.description
+                      FROM videos v
+                      JOIN video_tags vt ON vt.video_id = v.video_id
+                     WHERE v.channel_name = ?
+                       AND v.status IN ({status_placeholders})
+                       AND vt.tag_id = ?
+                       {window_clause}
+                  ORDER BY v.upload_date DESC NULLS LAST, v.seen_at DESC
+                     LIMIT ?""",
+                (ch["name"], *status_filter, tag_filter_id, *window_args, limit),
+            ).fetchall()
+    else:
+        videos = await db.execute(
+            f"""SELECT v.video_id, v.title, v.duration, v.upload_date,
+                       v.thumbnail_url, v.url, v.status
+                  FROM videos v
+                 WHERE v.channel_name = ?
+                   AND v.status IN ({status_placeholders})
+                   {shorts_clause}
+                   {window_clause}
+              ORDER BY v.upload_date DESC NULLS LAST, v.seen_at DESC
+                 LIMIT ?""",
+            (ch["name"], *status_filter, *window_args, limit),
+        ).fetchall()
+
+    # Title filters run in Python (they're free-form regex, not SQL
+    # LIKE), so the cached payload is the *post-filter* list — a hit
+    # skips this too.
+    if title_inc_re or title_exc_re:
+        kept = []
+        for v in videos:
+            title = v["title"] or ""
+            if title_inc_re and not title_inc_re.search(title):
+                continue
+            if title_exc_re and title_exc_re.search(title):
+                continue
+            kept.append(v)
+        videos = kept
+
+    payload = {
+        "videos": videos,
+        "counts": counts,
+        "actionable": actionable,
+        "channel_tag_match": channel_tag_match,
+    }
+    if use_cache:
+        await _cache_set(
+            key, payload, _slice_ttl(ch.get("last_polled_at"), cs)
+        )
+    return payload
+
+
 @app.get("/board")
 @auth_required
 async def board_partial():
@@ -868,17 +1291,7 @@ async def board_partial():
         ).fetchone()
         tag_filter_id = row["id"] if row else -1
 
-    if show_hidden:
-        status_filter = ("hidden",)
-    else:
-        # wytchr is a selector, not a library view: only show videos
-        # the operator hasn't acted on yet.
-        status_filter = ("new",)
-    status_placeholders = ",".join("?" * len(status_filter))
-
     settings_map = await _channel_settings_map(db)
-
-    PER_CHANNEL_LIMIT = 20
 
     columns = []
     for ch in channels:
@@ -886,88 +1299,18 @@ async def board_partial():
         if cs["hide_channel"] and not show_hidden:
             continue
 
-        per_channel_limit = PER_CHANNEL_LIMIT
+        slice_ = await _channel_slice(
+            db,
+            ch,
+            cs,
+            show_hidden=show_hidden,
+            tag_filter_id=tag_filter_id,
+            tag_filter_name=tag_filter_name,
+        )
+        videos = slice_["videos"]
+        counts = slice_["counts"]
+        actionable = slice_["actionable"]
 
-        shorts_clause = "" if cs["include_shorts"] else " AND v.url NOT LIKE '%/shorts/%'"
-        shorts_clause_count = "" if cs["include_shorts"] else " AND url NOT LIKE '%/shorts/%'"
-        title_inc_re = _compile_title_re(cs["title_include"])
-        title_exc_re = _compile_title_re(cs["title_exclude"])
-
-        count_rows = await db.execute(
-            f"SELECT status, COUNT(*) AS n FROM videos WHERE channel_name = ? {shorts_clause_count} GROUP BY status",
-            (ch["name"],),
-        ).fetchall()
-        counts = {row["status"]: row["n"] for row in count_rows}
-        actionable = counts.get("new", 0)
-        if title_inc_re or title_exc_re:
-            # SQL can't see the title regexes, so the raw 'new' count would
-            # promise more than the column shows — and the bulk-action
-            # confirm copy reads off this number. Recount the hard way.
-            actionable = len(await _actionable_video_ids(db, ch["name"], cs))
-
-        window_clause = ""
-        window_args: tuple = ()
-
-        if tag_filter_id is not None:
-            channel_has_tag = await db.execute(
-                "SELECT 1 FROM channel_tags WHERE channel_name = ? AND tag_id = ?",
-                (ch["name"], tag_filter_id),
-            ).fetchone()
-            if channel_has_tag:
-                videos = await db.execute(
-                    f"""SELECT v.video_id, v.title, v.duration, v.upload_date,
-                               v.thumbnail_url, v.url, v.status, v.favorited_at,
-                               v.description
-                          FROM videos v
-                         WHERE v.channel_name = ?
-                           AND v.status IN ({status_placeholders})
-                           {shorts_clause}
-                           {window_clause}
-                      ORDER BY v.upload_date DESC NULLS LAST, v.seen_at DESC
-                         LIMIT ?""",
-                    (ch["name"], *status_filter, *window_args, per_channel_limit),
-                ).fetchall()
-            else:
-                videos = await db.execute(
-                    f"""SELECT v.video_id, v.title, v.duration, v.upload_date,
-                               v.thumbnail_url, v.url, v.status, v.favorited_at,
-                               v.description
-                          FROM videos v
-                          JOIN video_tags vt ON vt.video_id = v.video_id
-                         WHERE v.channel_name = ?
-                           AND v.status IN ({status_placeholders})
-                           AND vt.tag_id = ?
-                           {window_clause}
-                      ORDER BY v.upload_date DESC NULLS LAST, v.seen_at DESC
-                         LIMIT ?""",
-                    (ch["name"], *status_filter, tag_filter_id, *window_args, per_channel_limit),
-                ).fetchall()
-                if not videos:
-                    continue
-        else:
-            videos = await db.execute(
-                f"""SELECT v.video_id, v.title, v.duration, v.upload_date,
-                           v.thumbnail_url, v.url, v.status
-                      FROM videos v
-                     WHERE v.channel_name = ?
-                       AND v.status IN ({status_placeholders})
-                       {shorts_clause}
-                       {window_clause}
-                  ORDER BY v.upload_date DESC NULLS LAST, v.seen_at DESC
-                     LIMIT ?""",
-                (ch["name"], *status_filter, *window_args, per_channel_limit),
-            ).fetchall()
-
-        if title_inc_re or title_exc_re:
-            kept = []
-            for v in videos:
-                title = v["title"] or ""
-                if title_inc_re and not title_inc_re.search(title):
-                    continue
-                if title_exc_re and title_exc_re.search(title):
-                    continue
-                kept.append(v)
-            videos = kept
 
         # A channel with nothing left after filtering is just scroll
         # distance — drop the column entirely.
@@ -1089,6 +1432,9 @@ async def add_video_tag(video_id: str):
         (video_id, tag_id),
     )
     await db.commit()
+    # Tag membership decides whether this video appears under a
+    # tag-filtered board view.
+    await _invalidate_video(db, video_id)
     return await _render_video_tags(db, video_id)
 
 
@@ -1104,6 +1450,7 @@ async def delete_video_tag(video_id: str, tag_name: str):
         (video_id, norm),
     )
     await db.commit()
+    await _invalidate_video(db, video_id)
     return await _render_video_tags(db, video_id)
 
 
@@ -1123,6 +1470,9 @@ async def add_channel_tag(channel_name: str):
         (channel_name, tag_id),
     )
     await db.commit()
+    # A channel tag flips channel_tag_match, which decides whether the
+    # column survives a tag filter at all.
+    await _invalidate_channel(channel_name)
     return await _render_channel_tags(db, channel_name)
 
 
@@ -1138,6 +1488,7 @@ async def delete_channel_tag(channel_name: str, tag_name: str):
         (channel_name, norm),
     )
     await db.commit()
+    await _invalidate_channel(channel_name)
     return await _render_channel_tags(db, channel_name)
 
 
@@ -1510,6 +1861,10 @@ async def rename_tag(old_name: str):
         await db.execute("DELETE FROM channel_tags WHERE tag_id = ?", (old_id,))
         await db.execute("DELETE FROM tags WHERE id = ?", (old_id,))
         await db.commit()
+        # A merge repoints video_tags/channel_tags across arbitrarily
+        # many channels at once — cheaper to drop everything than to
+        # work out the affected set.
+        await _invalidate_all()
         return redirect(f"/tags?flash=merged+into+{new_norm}")
     await db.execute("UPDATE tags SET name = ? WHERE id = ?", (new_norm, old_id))
     await db.commit()
@@ -1522,6 +1877,9 @@ async def delete_tag(name: str):
     db = await get_db()
     await db.execute("DELETE FROM tags WHERE name = ?", (name,))
     await db.commit()
+    # ON DELETE CASCADE takes video_tags/channel_tags rows with it, again
+    # across an unknown set of channels.
+    await _invalidate_all()
     return redirect(f"/tags?flash=deleted+{name}")
 
 
@@ -1569,6 +1927,7 @@ async def hide_video(video_id: str):
         (int(time.time()), video_id),
     )
     await db.commit()
+    await _invalidate_video(db, video_id)
     if request.headers.get("HX-Request"):
         return ("", 200)
     return jsonify({"ok": True})
@@ -1585,6 +1944,7 @@ async def watched_video(video_id: str):
         (now, now, video_id),
     )
     await db.commit()
+    await _invalidate_video(db, video_id)
     if request.headers.get("HX-Request"):
         return ("", 200)
     return jsonify({"ok": True})
@@ -1652,6 +2012,10 @@ async def _bulk_channel_action(channel_name: str, action: str):
             )
         marked = cur.rowcount or 0
     await db.commit()
+    # Must precede the board_partial() re-render below, or the response
+    # is rebuilt from the slice we just invalidated the truth out of.
+    # Shared by watch-all and skip-all, so both are covered here.
+    await _invalidate_channel(channel_name)
     if request.headers.get("HX-Request"):
         body = await board_partial()
         resp = await make_response(body)
@@ -1687,6 +2051,7 @@ async def unhide_video(video_id: str):
         (int(time.time()), video_id),
     )
     await db.commit()
+    await _invalidate_video(db, video_id)
     if request.headers.get("HX-Request"):
         return await _render_card(video_id)
     return jsonify({"ok": True})
@@ -1759,6 +2124,7 @@ async def _enrich_and_fire(video_id: str) -> None:
                          FROM videos WHERE video_id = ?""",
                     (video_id,),
                 ).fetchone()
+                await _invalidate_channel(row["channel_name"])
     await _fire_webhooks("video.favorited", _video_payload(row))
 
 
@@ -1847,6 +2213,9 @@ async def favorite_video(video_id: str):
         # so the UI returns immediately. Description has to land before
         # the POST or the receiver gets notes=null.
         asyncio.create_task(_enrich_and_fire(video_id))
+    # favorited_at rides along in the tag-filtered slice payload, so a
+    # toggle leaves the star stale on that view without this.
+    await _invalidate_channel(row["channel_name"])
     if request.headers.get("HX-Request"):
         body = await _render_card(video_id)
         resp = await make_response(body)
@@ -1886,6 +2255,8 @@ async def fetch_video_description(video_id: str):
             (desc, video_id),
         )
         await db.commit()
+        # description is selected into the tag-filtered slice payload.
+        await _invalidate_video(db, video_id)
     if request.headers.get("HX-Request"):
         return await _render_card(video_id)
     return jsonify({"ok": bool(desc), "description": desc})
@@ -2010,6 +2381,7 @@ async def auto_mark_watched() -> dict:
     have watched_at populated.
     """
     summary: dict = {"channels": 0, "marked": 0}
+    swept: list[str] = []
     now = int(time.time())
     async with standalone_db() as db:
         rows = await db.execute(
@@ -2033,7 +2405,13 @@ async def auto_mark_watched() -> dict:
             marked = cur.rowcount or 0
             summary["channels"] += 1
             summary["marked"] += marked
+            if marked:
+                swept.append(r["channel_name"])
         await db.commit()
+    # After the commit, so a reader that misses mid-sweep can't refill
+    # the slice from the pre-update rows.
+    for channel_name in swept:
+        await _invalidate_channel(channel_name)
     if summary["marked"]:
         print(f"auto_mark_watched: {summary}", file=sys.stderr, flush=True)
     return summary
@@ -2041,8 +2419,18 @@ async def auto_mark_watched() -> dict:
 
 @app.before_serving
 async def _startup():
-    global _http_client, _scheduler
+    global _http_client, _scheduler, _valkey
     _http_client = httpx.AsyncClient()
+    # from_url() is lazy — it builds a pool without dialling, so an
+    # unreachable Valkey surfaces per-operation (and degrades via
+    # _cache_degrade) rather than blocking boot. decode_responses keeps
+    # scan_iter handing back str keys for the f-string in unlink.
+    _valkey = valkey.Valkey.from_url(
+        VALKEY_URL,
+        decode_responses=True,
+        socket_timeout=CACHE_SOCKET_TIMEOUT,
+        socket_connect_timeout=CACHE_SOCKET_TIMEOUT,
+    )
     await init_db()
     _scheduler = AsyncIOScheduler(timezone="UTC")
     _scheduler.add_job(
@@ -2056,13 +2444,19 @@ async def _startup():
 
 @app.after_serving
 async def _shutdown():
-    global _http_client, _scheduler
+    global _http_client, _scheduler, _valkey
     if _scheduler is not None:
         _scheduler.shutdown(wait=False)
         _scheduler = None
     if _http_client is not None:
         await _http_client.aclose()
         _http_client = None
+    if _valkey is not None:
+        try:
+            await _valkey.aclose()
+        except Exception as exc:  # noqa: BLE001 — shutdown must not raise
+            _cache_degrade("close", exc)
+        _valkey = None
 
 
 if __name__ == "__main__":

@@ -33,6 +33,11 @@ os.environ.setdefault("VALKEY_URL", "redis://127.0.0.1:6379/0")
 
 import app as wytchr  # noqa: E402
 
+try:
+    import valkey.asyncio as valkey_asyncio  # noqa: E402
+except ImportError:  # pragma: no cover — pre-cache revisions
+    valkey_asyncio = None
+
 TOKEN = os.environ["API_TOKEN"]
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -70,6 +75,35 @@ def _require_db():
         )
 
 
+async def _reset_cache():
+    """Drop every cached board slice between tests.
+
+    Without this the suite lies to itself: TRUNCATE resets Postgres but
+    leaves Valkey holding the previous test's rendered board, and since
+    tests reuse channel names ("chan"), test N reads test N-1's cards.
+
+    Deliberately *not* app._invalidate_all() — a fixture that cleans up
+    by calling the code under test would hide a bug in that code. A wrong
+    prefix there would leak state between tests and silence the test that
+    should have caught it. So: our own scan, over the prefix constant.
+
+    Scan-and-delete rather than FLUSHDB because VALKEY_URL may well point
+    at a shared dev instance; only keys this app owns are ours to drop.
+    """
+    prefix = getattr(wytchr, "CACHE_PREFIX", None)
+    if valkey_asyncio is None or prefix is None or not os.environ.get("VALKEY_URL"):
+        return
+    client = valkey_asyncio.Valkey.from_url(os.environ["VALKEY_URL"])
+    try:
+        keys = [
+            k async for k in client.scan_iter(match=f"{prefix}:*", count=500)
+        ]
+        if keys:
+            await client.unlink(*keys)
+    finally:
+        await client.aclose()
+
+
 @pytest.fixture
 async def client():
     """Authed test client, with before_serving/after_serving run.
@@ -82,6 +116,7 @@ async def client():
         async with wytchr.standalone_db() as db:
             for table in _TABLES:
                 await db.execute(f"TRUNCATE {table} CASCADE")
+        await _reset_cache()
         c = test_app.test_client()
         c.wytchr_auth = AUTH
         yield c

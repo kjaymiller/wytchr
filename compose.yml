@@ -11,7 +11,46 @@ services:
       # purpose — see install.sh. The app fails fast if unset.
       - DATABASE_URL=${DATABASE_URL:?DATABASE_URL required — run ./install.sh}
       - YOUTUBE_API_KEY=${YOUTUBE_API_KEY:?YOUTUBE_API_KEY required}
+      # The app requires a cache, but compose ships one — so this
+      # defaults to the sibling service and nobody has to think about it.
+      # Override only to point at an external Valkey.
+      - VALKEY_URL=${VALKEY_URL:-redis://valkey:6379/0}
       - POLL_INTERVAL_MINUTES=${POLL_INTERVAL_MINUTES:-30}
       - POLL_LIMIT=${POLL_LIMIT:-30}
+    depends_on:
+      valkey:
+        condition: service_healthy
     ports:
       - "5000:5000"
+
+  # Board read cache. Pure cache, deliberately: no volume and both
+  # persistence mechanisms off, because every key is derived from
+  # Postgres and rebuildable on the next miss — persisting it costs disk
+  # and buys nothing. allkeys-lru so an unexpected key-space blowup
+  # (say, a lot of distinct tag filters) evicts instead of OOMing the
+  # container. 128mb is generous for a single-operator board whose
+  # payloads are ~20 rows per channel; it exists as a ceiling, not a
+  # target.
+  #
+  # No host port published on purpose: this is reachable only on the
+  # compose network. An unauthenticated cache bound to a host interface
+  # is how you end up on Shodan.
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: wytchr-valkey
+    restart: unless-stopped
+    command:
+      - valkey-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - allkeys-lru
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
