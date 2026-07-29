@@ -40,7 +40,7 @@ from quart import (
     request,
 )
 
-__version__ = "0.18.0"
+__version__ = "0.18.1"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 # YouTube Data API v3 key. Required — drives channel resolution, the
@@ -2058,6 +2058,13 @@ async def unhide_video(video_id: str):
 
 
 async def _render_card(video_id: str):
+    """Re-render one card for an htmx swap.
+
+    `_card.html` reads `video_tags_map` — the bulk renderers build it
+    once for the whole board, so this path has to build its own
+    one-entry map. Omitting it doesn't degrade to an untagged card;
+    Jinja raises UndefinedError and the swap 500s.
+    """
     db = await get_db()
     row = await db.execute(
         """SELECT video_id, title, duration, upload_date, thumbnail_url, url, status, channel_name, favorited_at, description
@@ -2066,7 +2073,8 @@ async def _render_card(video_id: str):
     ).fetchone()
     if not row:
         return ("", 404)
-    return await render_template("_card.html", v=row)
+    tags_map = await _video_tags_map(db, [video_id])
+    return await render_template("_card.html", v=row, video_tags_map=tags_map)
 
 
 # --- Favorites + webhooks --------------------------------------------
