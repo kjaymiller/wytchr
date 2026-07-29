@@ -38,6 +38,7 @@ mutation-checked: the fix was reverted and the test confirmed to fail.
 | `test_bulk_actions.py` | watch-all / skip-all acting on videos the board never showed (shorts, title include/exclude); a skip stamping `watched_at` and so becoming indistinguishable from a watch — and getting swept by `auto_mark_watched` an hour later |
 | `test_board.py` | the `actionable` count coming from a SQL `COUNT` blind to the title regexes, so a channel showing one video offers to skip two; empty channels and empty profile sections rendering as scroll distance; the removed `totals` block coming back |
 | `test_channels_page.py` | the roster page under-reporting — it inherited the board's totals and has to count every channel, hidden and empty ones included |
+| `test_card_render.py` | the single-card htmx swaps (favorite, unhide, fetch-description) 500ing because `_render_card` rendered `_card.html` without the `video_tags_map` the template reads — invisible to every board test, since the board renderers build that map themselves |
 | `test_cache.py` | the board read cache going stale (a write that doesn't invalidate leaves watched cards on the board until the TTL expires) and the documented failure policy silently flipping — a Valkey outage must degrade to Postgres, not 500 |
 
 CI runs them on every push and PR (`.github/workflows/test.yml`),
