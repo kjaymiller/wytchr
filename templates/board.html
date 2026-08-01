@@ -380,8 +380,20 @@
          line; the nav strip (order:10, in app.css) lands last. */
       .topbar .action-controls { order: 2; margin-left: auto; }
       .topbar .search-controls { order: 3; width: 100%; }
-      .channel-search { width: 100%; }
-      .theme-picker { flex: 1; min-width: 0; }
+      /* Share the line rather than letting search take all of it: at
+         width:100% the select collapsed to a bare dropdown arrow with the
+         theme name clipped away, so you couldn't tell which was active.
+         The 8.5rem floor is what "black licorice" needs. */
+      .channel-search { flex: 1 1 auto; width: auto; min-width: 0; }
+      .theme-picker { flex: 0 1 8.5rem; min-width: 0; }
+
+      /* The title shares its line with watch-all / skip-all / RSS / gear,
+         and being the only flexible item it absorbed all the shortfall —
+         channel names ellipsed down to "C…", which makes two channels
+         indistinguishable. Let the row wrap so the buttons drop to their
+         own line and the name keeps its width. */
+      .channel-head .summary-row { flex-wrap: wrap; }
+      .channel-head .summary-row .title { flex: 1 1 60%; }
 
       .sections { gap: .75rem; }
       .section { padding: .5rem .45rem; }

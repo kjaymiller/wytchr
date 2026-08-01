@@ -96,8 +96,17 @@ Screenshots need the Playwright browser plus its system libs, once:
 
 ```bash
 uv run --with-requirements requirements-dev.txt playwright install chromium
-# Arch — Playwright's own `install-deps` is Debian-only:
-sudo pacman -S --needed libxcomposite libxdamage libxrandr atk at-spi2-atk at-spi2-core
+# Arch — Playwright's own `install-deps` is Debian-only (it shells out to apt):
+sudo pacman -S --needed libxcomposite libxdamage libxrandr at-spi2-core
+```
+
+Playwright's docs list `atk` and `at-spi2-atk` separately; on current Arch those
+were folded into `at-spi2-core`, and naming them makes pacman abort the whole
+transaction with "package not found". Verify with the binary Playwright actually
+launches — the headless shell, not `chrome`:
+
+```bash
+ldd ~/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell | grep "not found"
 ```
 
 ## Common tasks

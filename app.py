@@ -40,7 +40,7 @@ from quart import (
     request,
 )
 
-__version__ = "0.19.0"
+__version__ = "0.19.1"
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 # YouTube Data API v3 key. Required — drives channel resolution, the

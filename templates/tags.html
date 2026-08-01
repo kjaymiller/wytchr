@@ -37,7 +37,13 @@
     /* The rename field alone is 12rem, so name + rename + delete can't
        share a line on a phone. Stack, and let rename fill the width. */
     @media (max-width: 600px) {
-      .row { grid-template-columns: 1fr; gap: .5rem; padding: .7rem .75rem; }
+      /* minmax(0,1fr), not 1fr: `1fr` is `minmax(auto,1fr)`, and that auto
+         floor is the column's min-content — here the rename form's, which
+         is the input's default 20-character intrinsic width plus the
+         button, ~322px. min-width:0 on the input doesn't lower a flex
+         container's min-content contribution, so the column stayed wider
+         than the viewport. */
+      .row { grid-template-columns: minmax(0, 1fr); gap: .5rem; padding: .7rem .75rem; }
       .row form { display: flex; width: 100%; }
       .row input[name="new_name"] { flex: 1; min-width: 0; }
       .row button { padding: .5rem .8rem; }
