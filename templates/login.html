@@ -2,18 +2,24 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>wytchr · sign in</title>
+  <link rel="stylesheet" href="/static/app.css">
   <style>
-    :root { color-scheme: dark; }
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0a060d; color: #f3e9e6; font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; }
-    form { background: #15101a; border: 1px solid #2d2238; border-radius: 8px; padding: 1.5rem; min-width: 18rem; display: flex; flex-direction: column; gap: .75rem; }
+    /* Page-specific. Tokens and reset: /static/app.css */
+    body { min-height: 100svh; display: grid; place-items: center; padding: 1rem; }
+    form {
+      background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+      padding: 1.5rem; width: 100%; max-width: 22rem;
+      display: flex; flex-direction: column; gap: .75rem;
+    }
     h1 { margin: 0 0 .25rem 0; font-size: 1.05rem; letter-spacing: .02em; }
-    input { background: #050309; color: #f3e9e6; border: 1px solid #2d2238; border-radius: 4px; padding: .5rem .65rem; font: inherit; }
-    input:focus { outline: none; border-color: #ff5f87; }
-    button { background: #ff5f87; color: #1a0a14; border: 0; border-radius: 4px; padding: .55rem; font: inherit; font-weight: 600; cursor: pointer; transition: background .12s; }
-    button:hover { background: #ff7a9e; }
-    .err { color: #f25b5b; font-size: .85rem; }
-    .hint { color: #8a7d8a; font-size: .8rem; }
+    input { background: var(--bg-deep); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: .5rem .65rem; font: inherit; }
+    input:focus { outline: none; border-color: var(--accent); }
+    button { background: var(--accent); color: var(--accent-ink); border: 0; border-radius: 4px; padding: .55rem; font: inherit; font-weight: 600; cursor: pointer; transition: background .12s; }
+    button:hover { background: var(--accent-bright); }
+    .err { color: var(--danger); font-size: .85rem; }
+    .hint { color: var(--muted); font-size: .8rem; }
   </style>
 </head>
 <body>
@@ -24,6 +30,6 @@
     {% if error %}<div class="err">{{ error }}</div>{% endif %}
     <button type="submit">sign in</button>
   </form>
-  <div style="position: fixed; bottom: .5rem; right: .75rem; color: #6a5f6a; font-size: .7rem;">v{{ app_version }}</div>
+  <div class="version-stamp">v{{ app_version }}</div>
 </body>
 </html>

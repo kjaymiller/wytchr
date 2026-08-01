@@ -1,0 +1,41 @@
+#:schema https://mise.jdx.dev/schema/mise.json
+#
+# wytchr toolchain + task runner.
+#
+# Pins the tools the dev loop needs so a fresh clone gets the same Python and
+# the same pitchfork as everyone else. The daemons themselves still live in
+# pitchfork.toml — this file just wraps the commands you actually type.
+#
+#   mise install          # get the toolchain
+#   mise run dev          # bring up postgres + valkey + the app
+#   mise run test         # functional suite (needs `mise run dev` first)
+#   mise run shots        # render every template and screenshot it at 3 widths
+
+[tools]
+python = "3.13"
+uv = "latest"
+"aqua:jdx/pitchfork" = "latest"
+
+[tasks.dev]
+description = "start the local stack (postgres + valkey + app on :5050)"
+run = "pitchfork start --group wytchr"
+
+[tasks.logs]
+description = "tail the app log"
+run = "pitchfork logs -f web"
+
+[tasks.stop]
+description = "tear the local stack down"
+run = "pitchfork stop --group wytchr"
+
+[tasks.test]
+description = "run the functional suite against the local dev postgres"
+run = "uv run --python 3.13 --with-requirements requirements-dev.txt pytest {{arg(name='args', var=true, default='')}}"
+
+[tasks.shots]
+description = "render every template with fixture data and screenshot it at phone/tablet/desktop widths"
+run = "uv run --python 3.13 --with-requirements requirements-dev.txt python scripts/preview.py --shots"
+
+[tasks.preview]
+description = "render every template with fixture data and serve it on :8899 (no database needed)"
+run = "uv run --python 3.13 --with-requirements requirements-dev.txt python scripts/preview.py --serve"

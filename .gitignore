@@ -10,3 +10,6 @@ venv/
 data/
 .DS_Store
 pitchfork.local.toml
+
+# preview renders + screenshots (scripts/preview.py)
+.preview/
