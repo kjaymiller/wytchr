@@ -135,6 +135,11 @@ img { max-width: 100%; }
 .topbar {
   display: flex;
   align-items: center;
+  /* Wrap at every width, not just under the phone breakpoint: the board
+     carries nine controls and overflowed sideways at tablet widths, in
+     the gap between "fits on one line" and 600px. Wrapping is inert when
+     everything already fits. */
+  flex-wrap: wrap;
   gap: .75rem 1.25rem;
   padding: .75rem 1rem;
   border-bottom: 1px solid var(--line);
