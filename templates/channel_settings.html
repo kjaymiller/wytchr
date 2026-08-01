@@ -4,19 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>wytchr · {{ channel.name }} settings</title>
+  <link rel="stylesheet" href="/static/app.css">
   <style>
-    :root { color-scheme: dark; }
-    body, body[data-theme="licorice"] { --bg:#0a060d; --card:#15101a; --line:#2d2238; --fg:#f3e9e6; --muted:#8a7d8a; --accent:#ff5f87; --accent-ink:#1a0a14; --danger:#f25b5b; --ok:#b8e0a3; }
-    body[data-theme="marmite"] { --bg:#14100a; --card:#221a10; --line:#3d2f1d; --fg:#f7e7a8; --muted:#a89568; --accent:#f5c518; --accent-ink:#1a1208; --danger:#d63d3d; --ok:#9bc053; }
-    body[data-theme="sees"] { --bg:#14100c; --card:#221a14; --line:#3d2e22; --fg:#f5ebe0; --muted:#a89578; --accent:#d4a574; --accent-ink:#14100c; --danger:#c84545; --ok:#9aae6a; }
-    body[data-theme="jaffa"] { --bg:#1c0e04; --card:#2c1808; --line:#4c3018; --fg:#f5d8a8; --muted:#a8835a; --accent:#f97316; --accent-ink:#1c0e04; --danger:#d63d3d; --ok:#a8be58; }
-    *, *::before, *::after { box-sizing: border-box; }
-    body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; }
-    header { display: flex; align-items: center; gap: 1.25rem; padding: .75rem 1rem; border-bottom: 1px solid var(--line); }
-    header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; padding-right: .75rem; border-right: 1px solid var(--line); }
-    header a { color: var(--muted); text-decoration: none; font-size: .85rem; }
-    header a:hover { color: var(--accent); }
-    main { max-width: 48rem; padding: 1rem; margin: 0 auto; }
+    /* Page-specific. Tokens, reset and top-bar chrome: /static/app.css */
+    main { max-width: 48rem; margin: 0 auto; }
     .flash { background: var(--card); border: 1px solid var(--ok); color: var(--ok); border-radius: 6px; padding: .55rem .75rem; font-size: .85rem; margin-bottom: 1rem; }
     .meta { color: var(--muted); font-size: .8rem; margin-bottom: 1rem; }
     .meta code { background: var(--card); padding: .05rem .35rem; border-radius: 3px; font-size: .9em; }
@@ -27,7 +18,7 @@
     .row label { color: var(--muted); font-size: .82rem; }
     .row .placeholder-note { color: var(--muted); font-size: .72rem; padding-left: .25rem; grid-column: 2; margin-top: -.35rem; }
     .feed-row { display: flex; gap: .5rem; align-items: center; }
-    .feed-row input { flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; }
+    .feed-row input { flex: 1; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; }
     .feed-row button { white-space: nowrap; }
     input[type=text], input[type=number] {
       background: var(--bg); color: var(--fg);
@@ -43,6 +34,17 @@
     button:hover { filter: brightness(1.1); }
     a.secondary { color: var(--muted); text-decoration: none; font-size: .85rem; }
     a.secondary:hover { color: var(--accent); }
+
+    /* An 11rem label column leaves ~9rem for the field on a phone —
+       put the label on its own line and give the input the width. */
+    @media (max-width: 600px) {
+      .card { padding: .7rem .75rem; }
+      .row { grid-template-columns: 1fr; gap: .25rem; margin-bottom: .85rem; }
+      .row .placeholder-note { grid-column: 1; margin-top: 0; padding-left: 0; }
+      .check-row { padding: .5rem 0; }
+      .check-row input { width: 1.15rem; height: 1.15rem; }
+      button { padding: .6rem 1rem; }
+    }
   </style>
 </head>
 <body data-theme="licorice">
@@ -65,10 +67,12 @@
     }
   }
 </script>
-<header>
+<header class="topbar">
   <h1>wytchr</h1>
-  <a href="/">board</a>
-  <a href="/tags">tags</a>
+  <nav class="nav-links">
+    <a href="/">board</a>
+    <a href="/tags">tags</a>
+  </nav>
 </header>
 <main>
   <h2 style="margin: 0 0 .25rem;">{{ channel.name }} settings</h2>
@@ -148,6 +152,6 @@
     </div>
   </form>
 </main>
-<div style="position: fixed; bottom: .5rem; right: .75rem; color: #6a5f6a; font-size: .7rem;">v{{ app_version }}</div>
+<div class="version-stamp">v{{ app_version }}</div>
 </body>
 </html>

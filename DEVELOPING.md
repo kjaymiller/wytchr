@@ -66,6 +66,40 @@ pitchfork stop --group wytchr       # tear the whole stack down
 - **Deps** — `uv run --with ...` mirrors the pinned versions in the `Dockerfile`.
   There's no lockfile yet; uv caches wheels so restarts stay fast.
 
+## Task runner
+
+`mise.toml` pins the toolchain (Python 3.13, uv, pitchfork) and wraps the
+commands you actually type, so a fresh clone doesn't have to memorise them:
+
+```bash
+mise install        # get the pinned toolchain
+mise run dev        # = pitchfork start --group wytchr
+mise run logs       # = pitchfork logs -f web
+mise run stop       # = pitchfork stop --group wytchr
+mise run test       # functional suite (needs `mise run dev` first)
+mise run preview    # render every template with fixture data on :8899, no DB
+mise run shots      # screenshot every template at 4 widths + flag overflow
+```
+
+Dev and test deps live in `requirements-dev.txt` (the runtime pins there mirror
+the `Dockerfile` — keep the two in sync when bumping).
+
+### Looking at layout without a database
+
+`scripts/preview.py` renders every template with stand-in context, so you can
+eyeball the chrome without Postgres, Valkey or a YouTube key. `mise run shots`
+then loads each page at 320 / 390 / 820 / 1440px, writes PNGs to `.preview/shots/`
+(gitignored), and **fails if anything is wider than the viewport** — that
+sideways-scroll is the specific thing that makes the site unusable on a phone.
+
+Screenshots need the Playwright browser plus its system libs, once:
+
+```bash
+uv run --with-requirements requirements-dev.txt playwright install chromium
+# Arch — Playwright's own `install-deps` is Debian-only:
+sudo pacman -S --needed libxcomposite libxdamage libxrandr atk at-spi2-atk at-spi2-core
+```
+
 ## Common tasks
 
 ```bash

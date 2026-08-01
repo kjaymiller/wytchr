@@ -13,6 +13,7 @@ RUN uv pip install --system --no-cache \
 WORKDIR /app
 COPY *.py /app/
 COPY templates /app/templates
+COPY static /app/static
 
 EXPOSE 5000
 # Hypercorn ASGI server. Single worker is plenty for the single-operator

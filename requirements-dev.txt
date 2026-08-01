@@ -1,0 +1,19 @@
+# Dev + test dependencies.
+#
+# The runtime pins mirror the Dockerfile's install list — the tests import
+# app.py directly, so they need the real runtime stack. Keep the two in sync
+# when bumping a pin (there is no lockfile in this repo yet).
+quart==0.20.*
+hypercorn==0.17.*
+apscheduler==3.*
+httpx==0.28.*
+psycopg[binary]==3.*
+valkey==6.*
+
+# Functional suite (see tests/README.md).
+pytest==8.*
+pytest-asyncio==1.*
+
+# Template preview + responsive screenshots: scripts/preview.py.
+# Needs a one-time browser download: `playwright install chromium`.
+playwright==1.*
