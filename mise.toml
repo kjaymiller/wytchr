@@ -30,12 +30,12 @@ run = "pitchfork stop --group wytchr"
 
 [tasks.test]
 description = "run the functional suite against the local dev postgres"
-run = "uv run --python 3.13 --with-requirements requirements-dev.txt pytest {{arg(name='args', var=true, default='')}}"
+run = "uv run --python 3.13 --with=develop pytest {{arg(name='args', var=true, default='')}}"
 
 [tasks.shots]
 description = "render every template with fixture data and screenshot it at phone/tablet/desktop widths"
-run = "uv run --python 3.13 --with-requirements requirements-dev.txt python scripts/preview.py --shots"
+run = "uv run --python 3.13 --with=develop python scripts/preview.py --shots"
 
 [tasks.preview]
 description = "render every template with fixture data and serve it on :8899 (no database needed)"
-run = "uv run --python 3.13 --with-requirements requirements-dev.txt python scripts/preview.py --serve"
+run = "uv run --python 3.13 --with=develop python scripts/preview.py --serve"

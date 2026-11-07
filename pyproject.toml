@@ -5,16 +5,31 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wytchr"
 version = "0.1.0"
-authors = [{ name = "Jay Miller", email = "kjaymiller@gmail.com" }]
 description = "a youtube-channel-manager"
 readme = "README.md"
-requires-python = ">=3.8"
-classifiers = [
-  "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
-  "Operating System :: OS Independent",
+authors = [
+    { name = "Jay Miller", email = "kjaymiller@gmail.com" }
+]
+requires-python = ">=3.9"
+dependencies = [
+    "quart==0.20.*",
+    "hypercorn==0.17.*",
+    "apscheduler==3.*",
+    "httpx==0.28.*",
+    "psycopg[binary]==3.*",
+    "valkey==6.*"
 ]
 
-[project.urls]
-Homepage = "https://github.com/yourusername/wytchr"
-"Bug Tracker" = "https://github.com/yourusername/wytchr/issues"
+[project.optional-dependencies]
+develop = [
+    "pytest==8.*",
+    "pytest-asyncio==1.*",
+    "playwright==1.*"
+]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app"]

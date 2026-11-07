@@ -81,7 +81,7 @@ mise run preview    # render every template with fixture data on :8899, no DB
 mise run shots      # screenshot every template at 4 widths + flag overflow
 ```
 
-Dev and test deps live in `requirements-dev.txt` (the runtime pins there mirror
+Dev and test deps live in `pyproject.toml` in the `dependencies` and `optional-dependencies` sections (the runtime pins there mirror
 the `Dockerfile` — keep the two in sync when bumping).
 
 ### Looking at layout without a database
@@ -95,7 +95,7 @@ sideways-scroll is the specific thing that makes the site unusable on a phone.
 Screenshots need the Playwright browser plus its system libs, once:
 
 ```bash
-uv run --with-requirements requirements-dev.txt playwright install chromium
+uv run --with=develop playwright install chromium
 # Arch — Playwright's own `install-deps` is Debian-only (it shells out to apt):
 sudo pacman -S --needed libxcomposite libxdamage libxrandr at-spi2-core
 ```

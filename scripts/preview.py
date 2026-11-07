@@ -11,7 +11,7 @@ the chrome, and screenshot it at the widths the CSS actually branches on.
 
 `--shots` needs the Playwright browser, a one-time download:
 
-    uv run --with-requirements requirements-dev.txt playwright install chromium
+    uv run --with=develop playwright install chromium
 
 The overflow check is the point of the whole thing: a page whose content is
 wider than the viewport is the specific failure that makes a site unusable on
@@ -175,8 +175,7 @@ def shoot(pages: list[str]) -> int:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        print("playwright is not installed — `uv run --with-requirements "
-              "requirements-dev.txt python scripts/preview.py --shots`", file=sys.stderr)
+        print("playwright is not installed — `uv run --with=develop python scripts/preview.py --shots`", file=sys.stderr)
         return 2
 
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(OUT))
