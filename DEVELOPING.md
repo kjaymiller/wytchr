@@ -77,6 +77,7 @@ mise run dev        # = pitchfork start --group wytchr
 mise run logs       # = pitchfork logs -f web
 mise run stop       # = pitchfork stop --group wytchr
 mise run test       # functional suite (needs `mise run dev` first)
+mise run lint       # ruff check the Python sources
 mise run preview    # render every template with fixture data on :8899, no DB
 mise run shots      # screenshot every template at 4 widths + flag overflow
 ```
