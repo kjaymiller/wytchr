@@ -9,6 +9,7 @@
 #   mise install          # get the toolchain
 #   mise run dev          # bring up postgres + valkey + the app
 #   mise run test         # functional suite (needs `mise run dev` first)
+#   mise run lint         # ruff check the Python sources
 #   mise run shots        # render every template and screenshot it at 3 widths
 
 [tools]
@@ -31,6 +32,10 @@ run = "pitchfork stop --group wytchr"
 [tasks.test]
 description = "run the functional suite against the local dev postgres"
 run = "uv run --python 3.13 --with=develop pytest {{arg(name='args', var=true, default='')}}"
+
+[tasks.lint]
+description = "ruff check the Python sources"
+run = "uv run --python 3.13 --extra develop ruff check ."
 
 [tasks.shots]
 description = "render every template with fixture data and screenshot it at phone/tablet/desktop widths"

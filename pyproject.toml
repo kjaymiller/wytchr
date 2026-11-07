@@ -24,7 +24,8 @@ dependencies = [
 develop = [
     "pytest==8.*",
     "pytest-asyncio==1.*",
-    "playwright==1.*"
+    "playwright==1.*",
+    "ruff==0.*"
 ]
 
 [tool.setuptools]
@@ -33,3 +34,11 @@ package-dir = {"" = "."}
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["app"]
+
+[tool.ruff]
+# Pin ruff's long-standing default rule set explicitly: recent ruff releases
+# widened the implicit default, and this repo wants the stable core checks
+# (pycodestyle E4/E7/E9 + pyflakes F) so `mise run lint` stays reproducible.
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
