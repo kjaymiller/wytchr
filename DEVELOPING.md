@@ -76,14 +76,18 @@ mise install        # get the pinned toolchain
 mise run dev        # = pitchfork start --group wytchr
 mise run logs       # = pitchfork logs -f web
 mise run stop       # = pitchfork stop --group wytchr
-mise run test       # functional suite (needs `mise run dev` first)
-mise run lint       # ruff check the Python sources
+mise run test       # functional + visual suite (needs `mise run dev` first)
+mise run test:visual # just the Playwright tests, PNGs in .preview/playwright
+mise run lint       # ruff check + the shell buildfile
 mise run preview    # render every template with fixture data on :8899, no DB
 mise run shots      # screenshot every template at 4 widths + flag overflow
 ```
 
-Dev and test deps live in `pyproject.toml` in the `dependencies` and `optional-dependencies` sections (the runtime pins there mirror
-the `Dockerfile` — keep the two in sync when bumping).
+Dev and test deps live in `pyproject.toml`: runtime pins in `dependencies`
+(the pins there mirror the `Dockerfile` — keep the two in sync when bumping),
+test tooling in the `dev` dependency group. A dependency group, not an extra,
+so a plain `uv sync` installs pytest, playwright and ruff — which is what the
+software factory's `uv sync --all-groups` needs.
 
 ### Looking at layout without a database
 
@@ -96,7 +100,7 @@ sideways-scroll is the specific thing that makes the site unusable on a phone.
 Screenshots need the Playwright browser plus its system libs, once:
 
 ```bash
-uv run --with=develop playwright install chromium
+uv run playwright install chromium
 # Arch — Playwright's own `install-deps` is Debian-only (it shells out to apt):
 sudo pacman -S --needed libxcomposite libxdamage libxrandr at-spi2-core
 ```

@@ -46,17 +46,32 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
+      - name: Install dependencies
+        run: uv sync --frozen --python 3.13
+
+      # The Chromium the visual tests drive. The version follows the pinned
+      # Python playwright in uv.lock, so cache on that.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install Chromium
+        run: uv run playwright install --with-deps chromium
+
       - name: Run tests
         env:
           DATABASE_URL: postgres://wytchr:wytchr@127.0.0.1:5432/wytchr
           VALKEY_URL: redis://127.0.0.1:6379/0
           API_TOKEN: test-token
-        run: |
-          uv run --python 3.13 \
-            --with 'quart==0.20.*' \
-            --with 'apscheduler==3.*' \
-            --with 'httpx==0.28.*' \
-            --with 'psycopg[binary]==3.*' \
-            --with 'valkey==6.*' \
-            --with pytest --with pytest-asyncio \
-            pytest -q
+          # A missing browser fails here instead of skipping the visual tests.
+          WYTCHR_VISUAL_REQUIRED: "1"
+        run: uv run pytest -q
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-screenshots
+          path: .preview/playwright/
+          if-no-files-found: ignore
