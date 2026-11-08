@@ -124,3 +124,36 @@ async def test_skip_all_removes_the_channel_from_the_board(client):
 
     assert 'data-channel="chan"' not in await board_html(client)
     assert 'data-channel="chan"' in await board_html(client, "?hidden=1")
+
+
+async def page(client):
+    """The board *page*, not the /board fragment: the view toggle and
+    its stylesheet live in board.html around the #board target."""
+    resp = await client.get("/", headers=AUTH)
+    assert resp.status_code == 200
+    return (await resp.get_data()).decode()
+
+
+async def test_board_offers_card_and_title_views(client):
+    """The toggle is the whole feature: without both buttons a user
+    can't switch, and without the title-view rules the switch would do
+    nothing but move a highlight."""
+    html = await page(client)
+
+    assert 'class="view-toggle"' in html
+    assert 'data-view="card"' in html
+    assert 'data-view="title"' in html
+    # Title view has to actually collapse the cards to a title list.
+    assert '#board[data-view="title"]' in html
+
+
+async def test_title_view_keeps_the_titles_and_drops_the_chrome(client):
+    """Title links come from the server-rendered card, escaped the same
+    way as card view — the toggle only changes what CSS shows."""
+    await add_channel("chan")
+    await add_video("v1", "chan", title="a real video")
+
+    html = await board_html(client)
+
+    assert "a real video" in html
+    assert 'id="card-v1"' in html
