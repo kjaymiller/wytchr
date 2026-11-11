@@ -15,11 +15,53 @@ They need a throwaway Postgres. Easiest is the pitchfork dev instance:
 
 ```sh
 pitchfork start postgres     # host :5433, the default DATABASE_URL here
-uv run --python 3.13 \
-  --with 'quart==0.20.*' --with 'apscheduler==3.*' --with 'httpx==0.28.*' \
-  --with 'psycopg[binary]==3.*' --with pytest --with pytest-asyncio \
-  pytest -q
+uv sync                      # app + the `dev` group (pytest, playwright)
+uv run playwright install chromium   # once, for test_visual.py
+uv run pytest -q             # or: mise run test / mise run test:visual
 ```
+
+### Test credentials
+
+None of these are secret, and none reach YouTube:
+
+| Variable | Test value | What it does |
+|---|---|---|
+| `API_TOKEN` | `test-token` | wytchr's login. Send `Authorization: Bearer test-token`, or the `wytchr_token=test-token` cookie the login form sets |
+| `YOUTUBE_API_KEY` | `AIza` + 35 zeros | passes the boot-time format check; YouTube rejects it |
+
+Nothing in the suite calls the YouTube Data API. Pages that would show
+fetched data get it from the database instead: `conftest.py` helpers per
+test, and `scripts/seed_fixtures.py` for the visual tests and the factory's
+screenshots. Adding a channel by URL (`/channels/add`) and polling do need a
+real key, and have no automated coverage.
+
+### Visual tests (Playwright)
+
+`test_visual.py` seeds the DB, starts hypercorn on a free port and opens
+every page in Chromium at 320, 390, 820 and 1440px. Each page must return
+200 signed in, log no console errors or failed requests, have no broken
+images and not scroll sideways. A full-page PNG of each lands in
+`.preview/playwright/` (the CI run uploads them as an artifact). It also
+checks the signed-out redirect and the token login.
+
+Without a browser these tests skip; `WYTCHR_VISUAL_REQUIRED=1` (set in CI)
+makes that a failure. The Python `playwright` is pinned to the version in
+the software factory's workcell image, so in a cell it uses the Chromium
+that is already installed. Bump both together.
+
+### Software factory
+
+[kjaymiller/factory](https://github.com/kjaymiller/factory) builds PRs for
+this repo in a workcell with a throwaway Postgres (and Valkey, on the docker
+backend) and no Docker socket. It uses:
+
+- `mise run test` and `mise run lint` as its gates. Both need only `uv`.
+- `factory/visual.sh` for the screenshots in each PR: `setup` seeds the
+  scratch DB, `serve` runs the app on 127.0.0.1:8000, and `auth` prints
+  `AUTH=wytchr_token=test-token`.
+
+htmx and Sortable are vendored in `static/vendor/` so pages render in a
+sandbox with no CDN access.
 
 Point `DATABASE_URL` elsewhere to use a different one. **The suite skips
 rather than fails when no Postgres is reachable** — check for `skipped`
@@ -40,6 +82,7 @@ mutation-checked: the fix was reverted and the test confirmed to fail.
 | `test_channels_page.py` | the roster page under-reporting — it inherited the board's totals and has to count every channel, hidden and empty ones included |
 | `test_card_render.py` | the single-card htmx swaps (favorite, unhide, fetch-description) 500ing because `_render_card` rendered `_card.html` without the `video_tags_map` the template reads — invisible to every board test, since the board renderers build that map themselves |
 | `test_cache.py` | the board read cache going stale (a write that doesn't invalidate leaves watched cards on the board until the TTL expires) and the documented failure policy silently flipping — a Valkey outage must degrade to Postgres, not 500 |
+| `test_visual.py` | what only a browser sees: a board whose htmx never loaded (blank, but still a 200), a page that scrolls sideways on a 320px phone, broken thumbnails, the login redirect |
 
 CI runs them on every push and PR (`.github/workflows/test.yml`),
 against service containers rather than the compose stack below.

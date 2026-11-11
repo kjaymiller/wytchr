@@ -20,12 +20,17 @@ dependencies = [
     "valkey==6.*"
 ]
 
-[project.optional-dependencies]
-develop = [
+# Test tooling. A dependency group, not an extra, so `uv sync` (and the
+# software factory's `uv sync --all-groups`) installs it by default.
+# playwright is pinned to the version the factory's workcell image ships
+# (PLAYWRIGHT_VERSION in kjaymiller/factory workcell/Dockerfile), so the
+# visual tests use the Chromium already in the cell. Bump them together.
+[dependency-groups]
+dev = [
     "pytest==8.*",
     "pytest-asyncio==1.*",
-    "playwright==1.*",
-    "ruff==0.*"
+    "playwright==1.52.0",
+    "ruff==0.*",
 ]
 
 [tool.setuptools]
